@@ -1,0 +1,178 @@
+# YOLO Training Suite - File Overview
+
+## Folder Structure
+```
+yolo_training/
+├── prepare_dataset.py           # Prepare dataset splits
+├── train_yolo.py               # Main training script
+├── inference.py                # Inference and evaluation
+├── config.py                   # Configuration & hyperparameters
+├── run_training_pipeline.py    # Quick start script
+├── requirements.txt            # Python dependencies
+├── README.md                   # Complete documentation
+└── QUICK_START.txt             # This file
+```
+
+## Quick Start (3 Steps)
+
+### Option 1: Run Everything Automatically
+```bash
+python run_training_pipeline.py
+```
+This runs all steps in sequence: prepare → train → evaluate
+
+### Option 2: Run Manually
+
+**Step 1: Prepare Dataset**
+```bash
+python prepare_dataset.py
+```
+- Creates train/val/test splits (70/20/10)
+- Generates `data.yaml` configuration
+- Output: `yolo_dataset_split/`
+
+**Step 2: Train Model**
+```bash
+python train_yolo.py
+```
+- Trains YOLO v8 segmentation model
+- Epochs: 100, Batch: 16, Image size: 640x640
+- Output: `runs/` with checkpoints and metrics
+
+**Step 3: Evaluate**
+
+**GUI Interface (Recommended):**
+```bash
+python inference_gui.py
+```
+- Interactive GUI for inference
+- Load images and see results visually
+- Adjust confidence thresholds
+- Save annotated images
+
+**Command-Line:**
+```bash
+python inference.py
+```
+- Evaluates on test set
+- Generates predictions
+- Output: `inference_results/`
+
+## Installation
+
+Install dependencies first:
+```bash
+pip install -r requirements.txt
+```
+
+Or manually:
+```bash
+pip install ultralytics torch torchvision opencv-python
+```
+
+## Configuration
+
+Edit `config.py` to customize:
+- Model size (yolov8n/s/m/l/x)
+- Training epochs, batch size
+- Learning rate, augmentation
+- Dataset split ratios
+- GPU/CPU device selection
+
+## Files Description
+
+| File | Purpose |
+|------|---------|
+| `prepare_dataset.py` | Split data into train/val/test sets |
+| `train_yolo.py` | Train YOLO segmentation model |
+| `inference.py` | Run inference and evaluation |
+| `inference_gui.py` | **NEW:** GUI for visual inference |
+| `config.py` | All hyperparameters and settings |
+| `run_training_pipeline.py` | Automated pipeline runner |
+| `README.md` | Detailed documentation |
+| `GUI_README.md` | GUI-specific documentation |
+| `requirements.txt` | Python dependencies |
+
+## Key Features
+
+✓ **Full Training Pipeline**: Prepare → Train → Evaluate
+✓ **Configurable Models**: Choose from 5 YOLO sizes
+✓ **Checkpoint Saving**: Every epoch (can stop/resume anytime)
+✓ **Resume Training**: Continue from where you left off
+✓ **GUI Interface**: Visual inference tool with PySide6
+✓ **Data Augmentation**: 10+ augmentation options
+✓ **Early Stopping**: Prevents overfitting
+✓ **Batch Inference**: Process multiple images
+✓ **Model Evaluation**: Complete metrics and visualization
+✓ **Easy Configuration**: Modify `config.py`
+✓ **GPU/CPU Support**: Automatic device selection
+
+## Output Locations
+
+After running the pipeline:
+
+```
+yolo_dataset_split/     → Dataset with train/val/test splits
+runs/                   → Training results, weights, metrics
+inference_results/      → Predictions on test set
+```
+
+## Important Notes
+
+1. **First Run**: Model weights will be downloaded automatically
+2. **Checkpoint Saving**: Models saved EVERY epoch to `last.pt` (can stop anytime!)
+3. **Resume Training**: Set `resume=True` to continue from last checkpoint
+4. **GPU Memory**: Reduce batch_size if you get CUDA out-of-memory errors
+5. **Data Path**: Ensure `yolo_dataset/` exists with images and labels
+6. **Training Time**: Medium model on GPU takes 1-2 hours for 100 epochs
+7. **GUI Dependencies**: Install PySide6 for the visual inference tool
+
+## Troubleshooting
+
+### OOM Error (GPU Memory)
+```python
+# In config.py
+'batch_size': 8  # Reduce from 16
+```
+
+### CPU Training is Slow
+```python
+# In config.py
+'device': 0  # Use GPU (or switch to GPU)
+```
+
+### Model Download Fails
+Ensure you have internet connection. Model will be cached locally.
+
+## Next Steps
+
+1. Customize `config.py` if needed
+2. Run `python run_training_pipeline.py`
+3. Monitor training in `runs/` folder
+4. Use `best.pt` model for production
+
+## Example Usage in Custom Code
+
+```python
+from train_yolo import YOLOSegmentationTrainer
+from config import get_train_config
+
+config = get_train_config()
+trainer = YOLOSegmentationTrainer('yolo_dataset_split/data.yaml')
+results = trainer.train(**config['training'])
+```
+
+Or for inference:
+
+```python
+from inference import YOLOSegmentationInference
+
+inference = YOLOSegmentationInference('runs/.../weights/best.pt')
+results = inference.predict_image('test_image.bmp')
+```
+
+## Support
+
+For more details, see `README.md` in this folder.
+
+For YOLO documentation: https://docs.ultralytics.com/

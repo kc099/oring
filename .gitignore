@@ -1,0 +1,14 @@
+dataset/
+__pycache__/
+maskrcnn/__pycache__/
+maskrcnn/dataset/
+dataset/
+Original Data/
+oring_crops/
+oring_patches_640/
+yolo_dataset/
+yolo_dataset_split/
+yolo_training/runs/
+yolo_training/*.pt
+*.pt
+rework/*.csv
