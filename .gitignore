@@ -1,7 +1,9 @@
 dataset/
+dataset_bkp/
 __pycache__/
 maskrcnn/__pycache__/
 maskrcnn/dataset/
+maskrcnn/dataset_bkp/
 dataset/
 Original Data/
 oring_crops/
@@ -12,3 +14,4 @@ yolo_training/runs/
 yolo_training/*.pt
 *.pt
 rework/*.csv
+binned/

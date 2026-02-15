@@ -329,7 +329,7 @@ class LabelingWindow(QMainWindow):
         """Load all image files from specified folders."""
         image_files = []
         seen_files = set()  # Track unique file paths to avoid duplicates
-        extensions = ['*.bmp', '*.BMP']
+        extensions = ['*.bmp', '*.BMP', '*.png', '*.PNG']
         
         for folder in self.image_folders:
             if not os.path.exists(folder):

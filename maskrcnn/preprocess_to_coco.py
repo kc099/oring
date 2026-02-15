@@ -1,16 +1,18 @@
 """
-Preprocessing: Convert dataset to COCO format + train/val/test split.
+Preprocessing: Convert binned 720×720 dataset to COCO format + train/val/test split.
 
-Always reads fresh from the source dataset/ folder, so if you relabel
-images there, just delete the maskrcnn/dataset/<model> folder and re-run.
+Reads 720×720 binned images from binned/<folder>/ and labels (mask JSONs)
+from binned/masks/<folder>/. Defect folders must have non-empty mask JSONs;
+good folders have no labels (empty annotations).
 
 This script:
-1) Reads 640x640 patches from dataset/images/<folder> and labels from dataset/labels/<folder>
-2) Filters: defect images must have polygons, good images must have empty labels
-3) Balances: keeps ALL defect images, samples good images = same count as defect
-4) Splits into train/val/test (80/10/10) per o-ring model
-5) Generates COCO JSON annotations for each split
-6) Copies images into organized folders
+1) Reads 720×720 images from binned/<folder>/ for each folder in the model config
+2) For defect folders: looks for _mask.json labels in binned/masks/<folder>/
+3) For good folders: includes all images with no annotations
+4) Balances: keeps ALL defect images, samples good images = same count as defect
+5) Splits into train/val/test (80/10/10) per o-ring model
+6) Generates COCO JSON annotations for each split
+7) Copies images into organized folders
 
 Usage:
     python preprocess_to_coco.py                      # process all models
@@ -19,7 +21,7 @@ Usage:
     python preprocess_to_coco.py --model combined      # model1 + model2 merged
 
 Author: GitHub Copilot
-Date: February 9, 2026
+Date: February 14, 2026
 """
 
 import json
@@ -32,7 +34,7 @@ from pathlib import Path
 from typing import List, Tuple, Dict
 
 from config import (
-    DATASET_ROOT, MASKRCNN_ROOT, OUTPUT_ROOT,
+    BINNED_ROOT, MASKS_ROOT, MASKRCNN_ROOT, OUTPUT_ROOT,
     ORING_MODELS, TRAINING_CONFIG, OringModelConfig
 )
 from utils import (
@@ -43,10 +45,14 @@ from utils import (
 
 def collect_samples(
     model_cfg: OringModelConfig,
-    dataset_root: Path
+    binned_root: Path,
+    masks_root: Path
 ) -> Tuple[List[dict], List[dict]]:
     """
     Collect defect and good samples for one o-ring model.
+
+    Images: binned_root/<folder>/*.bmp|*.png
+    Labels: masks_root/<folder>/<stem>_mask.json
 
     Returns:
         defect_samples: list of {"image_path": Path, "label_path": Path, "folder": str}
@@ -55,19 +61,17 @@ def collect_samples(
     defect_samples = []
     good_samples = []
 
-    images_root = dataset_root / "images"
-    labels_root = dataset_root / "labels"
-
     # --- Defect folders ---
     for folder in model_cfg.defect_folders:
-        img_dir = images_root / folder
-        lbl_dir = labels_root / folder
+        img_dir = binned_root / folder
+        lbl_dir = masks_root / folder
         if not img_dir.exists():
             print(f"  WARNING: {img_dir} not found, skipping")
             continue
 
-        for img_path in sorted(img_dir.glob("*.bmp")):
-            # Labels use _mask.json suffix: Image_xxx_patch_000.bmp → Image_xxx_patch_000_mask.json
+        for img_path in sorted(
+                p for ext in ("*.bmp", "*.png") for p in img_dir.glob(ext)):
+            # Labels use _mask.json suffix
             lbl_path = lbl_dir / (img_path.stem + "_mask.json")
             if not lbl_path.exists():
                 # Also try without _mask suffix as fallback
@@ -85,25 +89,15 @@ def collect_samples(
                     "folder": folder
                 })
 
-    # --- Good folders ---
+    # --- Good folders (no labels needed) ---
     for folder in model_cfg.good_folders:
-        img_dir = images_root / folder
-        lbl_dir = labels_root / folder
+        img_dir = binned_root / folder
         if not img_dir.exists():
             print(f"  WARNING: {img_dir} not found, skipping")
             continue
 
-        for img_path in sorted(img_dir.glob("*.bmp")):
-            # Good samples: either no label file, or label has no polygons
-            # Labels use _mask.json suffix
-            lbl_path = lbl_dir / (img_path.stem + "_mask.json")
-            if not lbl_path.exists():
-                lbl_path = lbl_dir / (img_path.stem + ".json")
-            if lbl_path.exists():
-                label = load_json_label(lbl_path)
-                polygons = polygons_from_label(label)
-                if len(polygons) > 0:
-                    continue  # This is mislabeled or ambiguous — skip
+        for img_path in sorted(
+                p for ext in ("*.bmp", "*.png") for p in img_dir.glob(ext)):
             good_samples.append({
                 "image_path": img_path,
                 "folder": folder
@@ -236,7 +230,7 @@ def preprocess_model(model_cfg: OringModelConfig, cfg=TRAINING_CONFIG):
     print(f"{'='*80}")
 
     # 1. Collect samples
-    defect_samples, good_samples = collect_samples(model_cfg, DATASET_ROOT)
+    defect_samples, good_samples = collect_samples(model_cfg, BINNED_ROOT, MASKS_ROOT)
     print(f"\n  Defect samples: {len(defect_samples)}")
     print(f"  Good samples:   {len(good_samples)}")
 

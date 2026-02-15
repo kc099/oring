@@ -17,7 +17,8 @@ from typing import List, Dict
 
 # ─── Paths ──────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(r"F:\standard elastomers")
-DATASET_ROOT = PROJECT_ROOT / "dataset"
+BINNED_ROOT = PROJECT_ROOT / "binned"           # binned 720×720 images
+MASKS_ROOT = BINNED_ROOT / "masks"              # labelled mask JSONs
 ORIGINAL_ROOT = PROJECT_ROOT / "Original Data"
 MASKRCNN_ROOT = PROJECT_ROOT / "maskrcnn"
 OUTPUT_ROOT = MASKRCNN_ROOT / "dataset"
@@ -41,24 +42,29 @@ class OringModelConfig:
 MODEL1_CONFIG = OringModelConfig(
     name="model1",
     good_folders=["model1good"],
-    defect_folders=["model1defect"],
-    mask_folders={"model1defect": "model1defect_masks"},
-    description="Model 1 O-Ring (model1good + model1defect)"
+    defect_folders=["model1defect", "model1defect2"],
+    mask_folders={"model1defect": "model1defect", "model1defect2": "model1defect2"},
+    description="Model 1 O-Ring (model1good + model1defect + model1defect2)"
 )
 
 MODEL2_CONFIG = OringModelConfig(
     name="model2",
     good_folders=["good"],
-    defect_folders=["notok"],
-    mask_folders={"notok": "notok_masks"},
-    description="Model 2 O-Ring (good + notok)"
+    defect_folders=["notok", "notok2"],
+    mask_folders={"notok": "notok", "notok2": "notok2"},
+    description="Model 2 O-Ring (good + notok + notok2)"
 )
 
 COMBINED_CONFIG = OringModelConfig(
     name="combined",
     good_folders=["model1good", "good"],
-    defect_folders=["model1defect", "notok"],
-    mask_folders={"model1defect": "model1defect_masks", "notok": "notok_masks"},
+    defect_folders=["model1defect", "model1defect2", "notok", "notok2"],
+    mask_folders={
+        "model1defect": "model1defect",
+        "model1defect2": "model1defect2",
+        "notok": "notok",
+        "notok2": "notok2",
+    },
     description="Combined (model1 + model2 data)"
 )
 
@@ -74,7 +80,7 @@ ORING_MODELS = {
 class TrainingConfig:
     """Hyperparameters for Mask R-CNN training."""
     # Data
-    image_size: int = 640               # input patch size
+    image_size: int = 720               # input size (fits binned+cropped o-ring images)
     num_classes: int = 2                 # background + defect
     train_ratio: float = 0.8
     val_ratio: float = 0.1
