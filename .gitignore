@@ -14,4 +14,5 @@ yolo_training/runs/
 yolo_training/*.pt
 *.pt
 rework/*.csv
+rework/*.json
 binned/
