@@ -870,10 +870,19 @@ class InspectionGUI(QMainWindow):
 
             # Check pass / fail
             passed = True
-            if ttype in ("range", "min") and val < lo:
-                passed = False
-            if ttype in ("range", "max") and val > hi:
-                passed = False
+            # outer_radius: only flag if TOO LARGE (ignore min — smaller outer is not rework)
+            # inner_radius: only flag if TOO SMALL (ignore max — larger inner is not rework)
+            if key == "outer_radius":
+                if val > hi:
+                    passed = False
+            elif key == "inner_radius":
+                if val < lo:
+                    passed = False
+            else:
+                if ttype in ("range", "min") and val < lo:
+                    passed = False
+                if ttype in ("range", "max") and val > hi:
+                    passed = False
 
             status_item = self.table.item(row, 4)
             if passed:
@@ -943,7 +952,10 @@ class InspectionGUI(QMainWindow):
             self._evaluate()
 
     def _load_best_thresholds(self) -> Dict[str, Dict]:
-        """Load tuned JSON if available, else fall back to σ-based."""
+        """Load tuned JSON if available, else fall back to σ-based.
+
+        After loading, widen all REJECT-category thresholds by 10 %.
+        """
         tuned_path = TUNED_JSON.get(self.current_model)
         if tuned_path:
             tuned = load_tuned_thresholds(tuned_path)
@@ -953,8 +965,26 @@ class InspectionGUI(QMainWindow):
                 for key in sigma_t:
                     if key not in tuned:
                         tuned[key] = sigma_t[key]
-                return tuned
-        return compute_thresholds(self.good_stats, self.sigma)
+                thresholds = tuned
+            else:
+                thresholds = compute_thresholds(self.good_stats, self.sigma)
+        else:
+            thresholds = compute_thresholds(self.good_stats, self.sigma)
+
+        # Widen REJECT thresholds by 10 %
+        reject_keys = {m[0] for m in METRIC_DEFS if m[8] == "reject"}
+        for key in reject_keys:
+            if key not in thresholds:
+                continue
+            lo = thresholds[key]["lo"]
+            hi = thresholds[key]["hi"]
+            # lo gets 10 % lower, hi gets 10 % higher
+            if lo > 0:
+                thresholds[key]["lo"] = round(lo * 0.9, 4)
+            if hi < 9999:
+                thresholds[key]["hi"] = round(hi * 1.1, 4)
+
+        return thresholds
 
     def _recompute_thresholds(self, sigma):
         self.sigma = sigma
