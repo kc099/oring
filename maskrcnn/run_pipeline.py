@@ -360,6 +360,8 @@ def main():
                         help="Override learning rate")
     parser.add_argument("--threshold", type=float, default=None,
                         help="Override score threshold for inference")
+    parser.add_argument("--multiclass", action="store_true",
+                        help="Use multi-class training (default: binary bg+defect)")
 
     args = parser.parse_args()
 
@@ -373,9 +375,12 @@ def main():
         cfg.learning_rate = args.lr
     if args.threshold:
         cfg.score_threshold = args.threshold
+    cfg.binary_mode = not args.multiclass
 
+    mode_str = "BINARY (bg+defect)" if cfg.binary_mode else "MULTI-CLASS (6 classes)"
     print("=" * 80)
     print(f"  MASK R-CNN PIPELINE — {ORING_MODELS[args.model].description}")
+    print(f"  Mode: {mode_str}")
     print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 80)
 

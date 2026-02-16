@@ -75,13 +75,30 @@ ORING_MODELS = {
 }
 
 
+# ─── Defect categories ──────────────────────────────────────────────────────
+# Mapping from category name → COCO category_id.
+# "defect" is the legacy/unlabeled category — maps to 1 (same as "cut").
+DEFECT_CATEGORIES = {
+    "cut":            1,
+    "hole":           2,
+    "tear":           3,
+    "foreign_object": 4,
+    "deformation":    5,
+    "defect":         1,   # backward compat: legacy unlabeled → cut
+}
+
+CATEGORY_NAMES = {v: k for k, v in DEFECT_CATEGORIES.items() if k != "defect"}
+# {1: "cut", 2: "hole", 3: "tear", 4: "foreign_object"}
+
+
 # ─── Dataset / Training parameters ──────────────────────────────────────────
 @dataclass
 class TrainingConfig:
     """Hyperparameters for Mask R-CNN training."""
     # Data
     image_size: int = 720               # input size (fits binned+cropped o-ring images)
-    num_classes: int = 2                 # background + defect
+    num_classes: int = 6                 # background + cut + hole + tear + foreign_object + deformation
+    binary_mode: bool = True             # True = collapse all defects to class 1 (bg+defect)
     train_ratio: float = 0.8
     val_ratio: float = 0.1
     test_ratio: float = 0.1
@@ -124,3 +141,8 @@ class TrainingConfig:
 
 
 TRAINING_CONFIG = TrainingConfig()
+
+
+def effective_num_classes(cfg: TrainingConfig = TRAINING_CONFIG) -> int:
+    """Return 2 in binary mode, otherwise cfg.num_classes."""
+    return 2 if cfg.binary_mode else cfg.num_classes

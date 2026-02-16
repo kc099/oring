@@ -38,7 +38,7 @@ from torchvision.models.detection import maskrcnn_resnet50_fpn, MaskRCNN_ResNet5
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 
-from config import OUTPUT_ROOT, ORING_MODELS, TRAINING_CONFIG, OringModelConfig
+from config import OUTPUT_ROOT, ORING_MODELS, TRAINING_CONFIG, OringModelConfig, effective_num_classes
 from dataset import OringDefectDataset, get_train_transforms, get_val_transforms, collate_fn
 
 
@@ -238,12 +238,14 @@ def train_model(model_name: str, cfg=TRAINING_CONFIG, resume_path: str = None):
     train_dataset = OringDefectDataset(
         image_dir=model_dir / "images" / "train",
         annotation_file=ann_dir / "train.json",
-        transforms=get_train_transforms(cfg)
+        transforms=get_train_transforms(cfg),
+        binary_mode=cfg.binary_mode
     )
     val_dataset = OringDefectDataset(
         image_dir=model_dir / "images" / "val",
         annotation_file=ann_dir / "val.json",
-        transforms=get_val_transforms()
+        transforms=get_val_transforms(),
+        binary_mode=cfg.binary_mode
     )
 
     print(f"  Train: {len(train_dataset)} images")
@@ -267,8 +269,10 @@ def train_model(model_name: str, cfg=TRAINING_CONFIG, resume_path: str = None):
     )
 
     # Model
-    print("\nBuilding Mask R-CNN...")
-    model = build_maskrcnn(num_classes=cfg.num_classes, cfg=cfg)
+    n_cls = effective_num_classes(cfg)
+    mode_str = "BINARY (bg+defect)" if cfg.binary_mode else f"MULTI-CLASS ({n_cls} classes)"
+    print(f"\nBuilding Mask R-CNN... [{mode_str}]")
+    model = build_maskrcnn(num_classes=n_cls, cfg=cfg)
     model.to(device)
 
     # Optimizer & Scheduler
@@ -385,7 +389,8 @@ def train_model(model_name: str, cfg=TRAINING_CONFIG, resume_path: str = None):
             "val_loss": val_loss,
             "config": {
                 "model_name": model_name,
-                "num_classes": cfg.num_classes,
+                "num_classes": n_cls,
+                "binary_mode": cfg.binary_mode,
                 "backbone": cfg.backbone,
             }
         }

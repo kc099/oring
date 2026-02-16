@@ -35,7 +35,8 @@ from typing import List, Tuple, Dict
 
 from config import (
     BINNED_ROOT, MASKS_ROOT, MASKRCNN_ROOT, OUTPUT_ROOT,
-    ORING_MODELS, TRAINING_CONFIG, OringModelConfig
+    ORING_MODELS, TRAINING_CONFIG, OringModelConfig,
+    DEFECT_CATEGORIES
 )
 from utils import (
     load_json_label, polygons_from_label,
@@ -81,8 +82,8 @@ def collect_samples(
 
             # Only include if there are actual polygons
             label = load_json_label(lbl_path)
-            polygons = polygons_from_label(label)
-            if len(polygons) > 0:
+            poly_cat_list = polygons_from_label(label)
+            if len(poly_cat_list) > 0:
                 defect_samples.append({
                     "image_path": img_path,
                     "label_path": lbl_path,
@@ -148,7 +149,11 @@ def build_coco_annotations(
         "images": [],
         "annotations": [],
         "categories": [
-            {"id": 1, "name": category_name, "supercategory": "defect"}
+            {"id": 1, "name": "cut",            "supercategory": "defect"},
+            {"id": 2, "name": "hole",           "supercategory": "defect"},
+            {"id": 3, "name": "tear",           "supercategory": "defect"},
+            {"id": 4, "name": "foreign_object", "supercategory": "defect"},
+            {"id": 5, "name": "deformation",    "supercategory": "defect"},
         ]
     }
 
@@ -180,16 +185,17 @@ def build_coco_annotations(
 
         # Add annotations
         label = load_json_label(lbl_path)
-        polygons = polygons_from_label(label)
-        for poly in polygons:
+        poly_cat_list = polygons_from_label(label)
+        for poly, cat in poly_cat_list:
             seg = polygon_to_coco_segmentation(poly)
             bbox = polygon_to_bbox(poly)
             area = polygon_area(poly)
+            cat_id = DEFECT_CATEGORIES.get(cat, 1)
 
             coco["annotations"].append({
                 "id": ann_id,
                 "image_id": img_id,
-                "category_id": 1,
+                "category_id": cat_id,
                 "segmentation": [seg],
                 "bbox": bbox,
                 "area": area,

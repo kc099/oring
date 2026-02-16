@@ -4,6 +4,7 @@ __pycache__/
 maskrcnn/__pycache__/
 maskrcnn/dataset/
 maskrcnn/dataset_bkp/
+maskrcnn/dataset_bkp2/
 dataset/
 Original Data/
 oring_crops/

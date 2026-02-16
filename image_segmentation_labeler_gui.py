@@ -19,10 +19,24 @@ from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QListWidget, QFileDialog, QMessageBox,
-    QGroupBox, QTextEdit
+    QGroupBox, QTextEdit, QComboBox
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QImage, QPixmap, QColor
+
+
+# ── Defect categories ────────────────────────────────────────────────────
+DEFECT_CATEGORIES = ["cut", "hole", "tear", "foreign_object", "deformation"]
+
+# Colors per category (BGR for OpenCV drawing)
+CATEGORY_COLORS = {
+    "cut":            (0, 0, 255),      # Red
+    "hole":           (0, 255, 0),      # Green
+    "tear":           (255, 0, 0),      # Blue
+    "foreign_object": (0, 165, 255),    # Orange
+    "deformation":    (255, 0, 255),    # Magenta
+    "defect":         (0, 255, 255),    # Yellow — legacy / unlabeled
+}
 
 
 class ImageCanvas(QLabel):
@@ -41,6 +55,7 @@ class ImageCanvas(QLabel):
         
         self.current_points = []        # points in ORIGINAL image coords
         self.completed_polygons = []    # polygons in ORIGINAL image coords
+        self.polygon_categories = []    # category string per completed polygon
         self.selected_polygon_index = None
         self.image = None               # original image (never modified)
         self.display_pixmap = None
@@ -72,6 +87,7 @@ class ImageCanvas(QLabel):
         self.image = cv_image.copy()
         self.current_points = []
         self.completed_polygons = []
+        self.polygon_categories = []
         self.selected_polygon_index = None
         self.zoom_level = 1.0
         self.pan_offset_x = 0.0
@@ -137,20 +153,32 @@ class ImageCanvas(QLabel):
         
         # Draw completed polygons (scale coords)
         for i, polygon in enumerate(self.completed_polygons):
-            color_idx = i % len(self.colors)
-            color = self.colors[color_idx]
+            # Use category-based color
+            cat = self.polygon_categories[i] if i < len(self.polygon_categories) else "defect"
+            bgr = CATEGORY_COLORS.get(cat, (0, 255, 255))
             
             pts = np.array([(int(px * s), int(py * s)) for (px, py) in polygon], dtype=np.int32)
             
             overlay = display_image.copy()
-            cv2.fillPoly(overlay, [pts], (color.blue(), color.green(), color.red()))
+            cv2.fillPoly(overlay, [pts], bgr)
             display_image = cv2.addWeighted(display_image, 0.6, overlay, 0.4, 0)
             
             if i == self.selected_polygon_index:
                 cv2.polylines(display_image, [pts], True, (255, 255, 255), 8)
-                cv2.polylines(display_image, [pts], True, (color.blue(), color.green(), color.red()), 5)
+                cv2.polylines(display_image, [pts], True, bgr, 5)
             else:
-                cv2.polylines(display_image, [pts], True, (color.blue(), color.green(), color.red()), 3)
+                cv2.polylines(display_image, [pts], True, bgr, 3)
+            
+            # Draw category label near top of polygon
+            cx = int(pts[:, 0].mean())
+            cy = int(pts[:, 1].min()) - 8
+            label_text = cat.upper()
+            font_scale = max(0.4, 0.4 * s)
+            (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+            cy = max(th + 4, cy)
+            cv2.rectangle(display_image, (cx - 2, cy - th - 4), (cx + tw + 4, cy + 4), bgr, -1)
+            cv2.putText(display_image, label_text, (cx, cy),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
         
         # Draw current polygon (in-progress)
         if len(self.current_points) > 0:
@@ -451,6 +479,42 @@ class LabelingWindow(QMainWindow):
         """)
         draw_layout.addWidget(self.polygon_count_label)
         
+        # Category selector
+        cat_row = QHBoxLayout()
+        cat_row.addWidget(QLabel("Category:"))
+        self.category_combo = QComboBox()
+        self.category_combo.addItems(DEFECT_CATEGORIES)
+        self.category_combo.setCurrentIndex(0)
+        self.category_combo.setStyleSheet("""
+            QComboBox {
+                padding: 6px 10px;
+                font-size: 11pt;
+                font-weight: bold;
+                background-color: white;
+                border: 2px solid #1976D2;
+                border-radius: 4px;
+            }
+        """)
+        cat_row.addWidget(self.category_combo)
+        draw_layout.addLayout(cat_row)
+
+        self.change_cat_btn = QPushButton("🏷️ Set Category for Selected")
+        self.change_cat_btn.setToolTip("Change the category of the currently selected polygon")
+        self.change_cat_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px;
+                font-size: 10pt;
+                font-weight: bold;
+                border-radius: 5px;
+                border: none;
+                background-color: #1976D2;
+                color: white;
+            }
+            QPushButton:hover { background-color: #1565C0; }
+        """)
+        self.change_cat_btn.clicked.connect(self.change_selected_category)
+        draw_layout.addWidget(self.change_cat_btn)
+        
         btn_style = """
             QPushButton {
                 padding: 12px;
@@ -729,9 +793,13 @@ class LabelingWindow(QMainWindow):
                 
                 # Load polygons from JSON
                 self.canvas.completed_polygons = []
+                self.canvas.polygon_categories = []
                 for polygon_data in mask_data.get('polygons', []):
                     points = [(pt['x'], pt['y']) for pt in polygon_data['points']]
                     self.canvas.completed_polygons.append(points)
+                    # Backward compat: old masks without "category" → "defect"
+                    cat = polygon_data.get('category', 'defect')
+                    self.canvas.polygon_categories.append(cat)
                     
                     # Update mask
                     pts = np.array(points, dtype=np.int32)
@@ -741,7 +809,8 @@ class LabelingWindow(QMainWindow):
                 self.canvas.update_display()
                 
                 num_polygons = len(self.canvas.completed_polygons)
-                print(f"  ✓ Loaded existing mask with {num_polygons} polygon(s)")
+                cats = set(self.canvas.polygon_categories)
+                print(f"  ✓ Loaded existing mask with {num_polygons} polygon(s), categories: {cats}")
                 
             except Exception as e:
                 print(f"  ⚠ Failed to load existing mask: {e}")
@@ -764,9 +833,12 @@ class LabelingWindow(QMainWindow):
         
         text = f"Polygons: {count}"
         if points > 0:
-            text += f" | Current points: {points}"
+            cat = self.category_combo.currentText()
+            text += f" | Current points: {points} [{cat}]"
         elif self.canvas.selected_polygon_index is not None:
-            text += f" | Selected: #{self.canvas.selected_polygon_index + 1}"
+            idx = self.canvas.selected_polygon_index
+            cat = self.canvas.polygon_categories[idx] if idx < len(self.canvas.polygon_categories) else "?"
+            text += f" | Selected: #{idx + 1} [{cat}]"
         
         self.polygon_count_label.setText(text)
     
@@ -775,6 +847,7 @@ class LabelingWindow(QMainWindow):
         if len(self.canvas.current_points) >= 3:
             # Add to completed polygons
             self.canvas.completed_polygons.append(self.canvas.current_points.copy())
+            self.canvas.polygon_categories.append(self.category_combo.currentText())
             
             # Update mask with white (255)
             pts = np.array(self.canvas.current_points, dtype=np.int32)
@@ -785,7 +858,8 @@ class LabelingWindow(QMainWindow):
             self.canvas.update_display()
             self.update_polygon_count()
             
-            print(f"✓ Polygon closed. Total polygons: {len(self.canvas.completed_polygons)}")
+            cat = self.canvas.polygon_categories[-1]
+            print(f"✓ Polygon closed [{cat}]. Total polygons: {len(self.canvas.completed_polygons)}")
         else:
             QMessageBox.information(self, "Info", "Need at least 3 points to close a polygon")
     
@@ -796,7 +870,8 @@ class LabelingWindow(QMainWindow):
             print(f"↩ Removed point: {removed}")
         elif self.canvas.completed_polygons:
             removed = self.canvas.completed_polygons.pop()
-            print(f"↩ Removed polygon with {len(removed)} points")
+            removed_cat = self.canvas.polygon_categories.pop() if self.canvas.polygon_categories else "?"
+            print(f"↩ Removed polygon [{removed_cat}] with {len(removed)} points")
             
             # Clear selection if we removed the selected polygon
             if self.canvas.selected_polygon_index is not None:
@@ -820,7 +895,8 @@ class LabelingWindow(QMainWindow):
             idx = self.canvas.selected_polygon_index
             if 0 <= idx < len(self.canvas.completed_polygons):
                 removed = self.canvas.completed_polygons.pop(idx)
-                print(f"❌ Deleted polygon #{idx + 1} with {len(removed)} points")
+                removed_cat = self.canvas.polygon_categories.pop(idx) if idx < len(self.canvas.polygon_categories) else "?"
+                print(f"❌ Deleted polygon #{idx + 1} [{removed_cat}] with {len(removed)} points")
                 
                 # Clear selection
                 self.canvas.selected_polygon_index = None
@@ -847,11 +923,25 @@ class LabelingWindow(QMainWindow):
             if reply == QMessageBox.Yes:
                 self.canvas.current_points = []
                 self.canvas.completed_polygons = []
+                self.canvas.polygon_categories = []
                 self.canvas.selected_polygon_index = None
                 self.mask = np.zeros((self.height, self.width), dtype=np.uint8)
                 self.canvas.update_display()
                 self.update_polygon_count()
                 print("🗑 All polygons cleared")
+    
+    def change_selected_category(self):
+        """Change the category of the currently selected polygon."""
+        idx = self.canvas.selected_polygon_index
+        if idx is not None and 0 <= idx < len(self.canvas.polygon_categories):
+            new_cat = self.category_combo.currentText()
+            old_cat = self.canvas.polygon_categories[idx]
+            self.canvas.polygon_categories[idx] = new_cat
+            self.canvas.update_display()
+            self.update_polygon_count()
+            print(f"🏷️ Polygon #{idx + 1} category: {old_cat} → {new_cat}")
+        else:
+            QMessageBox.information(self, "No Selection", "Please click on a polygon to select it first.")
     
     def zoom_in(self):
         """Zoom in by 20%."""
@@ -895,8 +985,10 @@ class LabelingWindow(QMainWindow):
         
         # Convert polygons to list format
         for i, polygon in enumerate(self.canvas.completed_polygons):
+            cat = self.canvas.polygon_categories[i] if i < len(self.canvas.polygon_categories) else "defect"
             polygon_data = {
                 "id": i + 1,
+                "category": cat,
                 "num_points": len(polygon),
                 "points": [{"x": int(pt[0]), "y": int(pt[1])} for pt in polygon]
             }

@@ -19,6 +19,9 @@ from typing import List, Dict, Tuple, Optional
 from pycocotools import mask as mask_utils
 
 
+from config import DEFECT_CATEGORIES, CATEGORY_NAMES
+
+
 # ─── Label I/O ───────────────────────────────────────────────────────────────
 
 def load_json_label(label_path: Path) -> dict:
@@ -27,17 +30,20 @@ def load_json_label(label_path: Path) -> dict:
         return json.load(f)
 
 
-def polygons_from_label(label: dict) -> List[List[Tuple[int, int]]]:
+def polygons_from_label(label: dict) -> List[Tuple[List[Tuple[int, int]], str]]:
     """
-    Extract polygon point lists from a JSON label.
-    Returns list of polygons, each polygon is a list of (x, y) tuples.
+    Extract polygon point lists and categories from a JSON label.
+    Returns list of (polygon, category) tuples.
+    Each polygon is a list of (x, y) tuples.
+    Old labels without a "category" field default to "defect".
     """
-    polygons = []
+    results = []
     for poly in label.get("polygons", []):
         points = [(p["x"], p["y"]) for p in poly["points"]]
         if len(points) >= 3:
-            polygons.append(points)
-    return polygons
+            cat = poly.get("category", "defect")
+            results.append((points, cat))
+    return results
 
 
 def polygon_to_mask(polygon: List[Tuple[int, int]], height: int, width: int) -> np.ndarray:
@@ -93,7 +99,7 @@ def build_coco_dataset(
         image_dir: Directory containing images
         label_dir: Directory containing JSON label files
         image_files: List of image file paths
-        category_name: Name of the defect category
+        category_name: (deprecated) ignored — multi-class categories used
 
     Returns:
         COCO-format dict with images, annotations, categories
@@ -102,7 +108,11 @@ def build_coco_dataset(
         "images": [],
         "annotations": [],
         "categories": [
-            {"id": 1, "name": category_name, "supercategory": "defect"}
+            {"id": 1, "name": "cut",            "supercategory": "defect"},
+            {"id": 2, "name": "hole",           "supercategory": "defect"},
+            {"id": 3, "name": "tear",           "supercategory": "defect"},
+            {"id": 4, "name": "foreign_object", "supercategory": "defect"},
+            {"id": 5, "name": "deformation",    "supercategory": "defect"},
         ]
     }
 
@@ -126,17 +136,18 @@ def build_coco_dataset(
             continue
 
         label = load_json_label(label_path)
-        polygons = polygons_from_label(label)
+        poly_cat_list = polygons_from_label(label)
 
-        for poly in polygons:
+        for poly, cat in poly_cat_list:
             seg = polygon_to_coco_segmentation(poly)
             bbox = polygon_to_bbox(poly)
             area = polygon_area(poly)
+            cat_id = DEFECT_CATEGORIES.get(cat, 1)
 
             coco["annotations"].append({
                 "id": ann_id,
                 "image_id": img_id,
-                "category_id": 1,
+                "category_id": cat_id,
                 "segmentation": [seg],
                 "bbox": bbox,
                 "area": area,
@@ -205,7 +216,7 @@ def draw_predictions(
         if boxes is not None and i < len(boxes):
             x1, y1, x2, y2 = boxes[i].astype(int)
             cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-            label_text = f"defect {score:.2f}"
+            label_text = f"{CATEGORY_NAMES.get(int(labels[i]), 'defect')} {score:.2f}"
             (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(vis, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
             cv2.putText(vis, label_text, (x1 + 2, y1 - 4),

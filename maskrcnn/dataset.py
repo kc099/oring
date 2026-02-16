@@ -31,7 +31,7 @@ class OringDefectDataset(Dataset):
         image:  (3, H, W) float tensor, normalized to [0, 1]
         target: dict with keys:
             - boxes:    (N, 4) float tensor [x1, y1, x2, y2]
-            - labels:   (N,) int64 tensor (1 = defect)
+            - labels:   (N,) int64 tensor (class ids)
             - masks:    (N, H, W) uint8 tensor
             - image_id: int tensor
             - area:     (N,) float tensor
@@ -42,16 +42,19 @@ class OringDefectDataset(Dataset):
         self,
         image_dir: Path,
         annotation_file: Path,
-        transforms=None
+        transforms=None,
+        binary_mode: bool = True
     ):
         """
         Args:
             image_dir: Directory containing images for this split
             annotation_file: Path to COCO JSON annotation file
             transforms: torchvision v2 transforms (applied to image + target)
+            binary_mode: If True, collapse all categories to 1 (defect)
         """
         self.image_dir = Path(image_dir)
         self.transforms = transforms
+        self.binary_mode = binary_mode
 
         # Load COCO annotations
         with open(annotation_file, 'r') as f:
@@ -116,7 +119,8 @@ class OringDefectDataset(Dataset):
                 continue
 
             boxes.append([x_min, y_min, x_max, y_max])
-            labels.append(1)  # 1 = defect
+            cat_id = ann.get("category_id", 1)
+            labels.append(1 if self.binary_mode else cat_id)
             masks.append(mask)
             areas.append(ann.get("area", float((x_max - x_min) * (y_max - y_min))))
             iscrowd.append(ann.get("iscrowd", 0))

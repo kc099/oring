@@ -70,12 +70,14 @@ class OringDefectDetector:
         checkpoint = torch.load(str(checkpoint_path), map_location=self.device)
 
         num_classes = checkpoint.get("config", {}).get("num_classes", 2)
+        self.binary_mode = checkpoint.get("config", {}).get("binary_mode", True)
         self.model = build_maskrcnn(num_classes=num_classes)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.to(self.device)
         self.model.eval()
 
-        print(f"Model loaded. Device: {self.device}")
+        mode_str = "binary" if self.binary_mode else f"multi-class ({num_classes})"
+        print(f"Model loaded. Device: {self.device}, mode: {mode_str}")
         print(f"  Epoch: {checkpoint.get('epoch', '?') + 1}")
         print(f"  Val loss: {checkpoint.get('best_val_loss', '?')}")
 
