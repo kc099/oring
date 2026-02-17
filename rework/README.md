@@ -131,6 +131,49 @@ detail banner).
 
 ---
 
+## Resolution Normalization
+
+All thresholds are calibrated at the **reference resolution** of **2448 × 2048**
+(original camera images). When a different-resolution image is loaded (e.g. a
+2×2 binned 1224 × 1024 image), measurements are automatically normalized so the
+same thresholds still apply.
+
+### How it works
+
+1. A **scale factor** is computed:  `scale = max(img_w, img_h) / max(2448, 2048)`.
+2. Each metric has a declared scale type:
+
+   | Scale type | Metrics | Normalization |
+   |------------|---------|---------------|
+   | **linear** | radii, thicknesses, distances, std devs, clearance | `value / scale` |
+   | **area** | `annular_area_k` | `value / scale²` |
+   | **none** | circularity, thickness_ratio, thickness_cv, eccentricity_pct | unchanged |
+
+3. The normalized values are compared against thresholds. The table in the UI
+   shows normalized values so they're directly comparable to the reference
+   thresholds.
+
+### Examples
+
+| Input image | scale | outer_radius raw | normalized |
+|-------------|-------|-----------------|-----------|
+| 2448 × 2048 (original) | 1.00 | 665 px | 665 px |
+| 1224 × 1024 (2×2 binned) | 0.50 | 332 px | 665 px |
+| 720 × 720 (binned+crop) | 0.29 | 195 px | 665 px |
+
+### Limitations
+
+- **Cropped images** (original resolution, but FOV trimmed to o-ring region):
+  contour-based measurements (radii, thickness, circularity) are unchanged
+  since they depend on contour geometry, not image size.  `edge_clearance` will
+  be incorrect because it measures distance to the image border, which is now
+  the crop boundary instead of the sensor edge.  All other metrics work fine.
+- The auto-detection assumes the aspect ratio stays roughly the same.  An
+  image that is both cropped and downsampled will get an approximate scale
+  based on the larger dimension.
+
+---
+
 ## File Reference
 
 | File | Purpose |

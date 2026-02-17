@@ -50,6 +50,68 @@ from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+# Reference resolution — thresholds are calibrated at this size
+REFERENCE_RESOLUTION = (2448, 2048)   # (width, height) of original camera images
+
+# How each metric scales with resolution
+#   "linear"  — proportional to pixel size  (divide by scale)
+#   "area"    — proportional to pixel area   (divide by scale²)
+#   "none"    — dimensionless ratio / percentage (no scaling)
+METRIC_SCALE_TYPE = {
+    "outer_radius":      "linear",
+    "inner_radius":      "linear",
+    "ring_thickness":    "linear",
+    "mean_thickness":    "linear",
+    "min_thickness":     "linear",
+    "max_thickness":     "linear",
+    "thickness_range":   "linear",
+    "thickness_std":     "linear",
+    "center_dist":       "linear",
+    "edge_clearance":    "linear",
+    "outer_radial_std":  "linear",
+    "inner_radial_std":  "linear",
+    "annular_area_k":    "area",
+    "circularity_outer": "none",
+    "circularity_inner": "none",
+    "thickness_ratio":   "none",
+    "thickness_cv":      "none",
+    "eccentricity_pct":  "none",
+}
+
+
+def compute_resolution_scale(img_w: int, img_h: int) -> float:
+    """Return scale factor relative to REFERENCE_RESOLUTION.
+
+    scale = 1.0 for original resolution, 0.5 for 2×2 binned, etc.
+    Uses the larger dimension to be robust to slight aspect changes.
+    """
+    ref = max(REFERENCE_RESOLUTION)
+    cur = max(img_w, img_h)
+    return cur / ref
+
+
+def normalize_measurements(result: Dict, scale: float) -> Dict:
+    """Scale pixel-based measurements back to reference resolution.
+
+    Divides linear metrics by *scale* and area metrics by *scale²*
+    so that the same thresholds work regardless of input resolution.
+    Dimensionless metrics are left unchanged.
+    Returns a **new** dict (original is not mutated).
+    """
+    if abs(scale - 1.0) < 1e-6:
+        return result          # nothing to do at native resolution
+
+    normed = dict(result)      # shallow copy
+    for key, stype in METRIC_SCALE_TYPE.items():
+        if key not in normed:
+            continue
+        if stype == "linear":
+            normed[key] = normed[key] / scale
+        elif stype == "area":
+            normed[key] = normed[key] / (scale * scale)
+    return normed
+
+
 # Per-model CSV paths (new format with comprehensive metrics)
 MODEL_CSV = {
     "Model 1": SCRIPT_DIR / "model1good_measurements.csv",
@@ -492,6 +554,8 @@ class InspectionGUI(QMainWindow):
         self.image: Optional[np.ndarray] = None
         self.overlay_image: Optional[np.ndarray] = None
         self.result: Optional[Dict] = None
+        self.result_normed: Optional[Dict] = None
+        self._resolution_scale: float = 1.0
 
         # Statistics & thresholds
         self.current_model = DEFAULT_MODEL
@@ -814,6 +878,11 @@ class InspectionGUI(QMainWindow):
                 "Try adjusting BG value or threshold.")
             return
 
+        # Auto-detect resolution scale and normalize to reference
+        h, w = self.image.shape[:2]
+        self._resolution_scale = compute_resolution_scale(w, h)
+        self.result_normed = normalize_measurements(self.result, self._resolution_scale)
+
         # Display overlay
         self.overlay_image = draw_overlay(self.image, self.result)
         self._show_cv(self.overlay_image, self.img_label)
@@ -829,16 +898,16 @@ class InspectionGUI(QMainWindow):
         # Evaluate against thresholds
         self._evaluate()
 
-        # Show extra informational metrics
-        dx = self.result["center_dx"]
-        dy = self.result["center_dy"]
+        # Show extra informational metrics (normalized values)
+        r = self.result_normed
+        scale_str = f"scale={self._resolution_scale:.2f}" if abs(self._resolution_scale - 1.0) > 0.01 else ""
         self.info_label.setText(
-            f"center_dx={dx:+.1f}  center_dy={dy:+.1f}  "
-            f"max_thick={self.result['max_thickness']:.1f}  "
-            f"thick_std={self.result['thickness_std']:.1f}  "
-            f"circ_o={self.result['circularity_outer']:.4f}  "
-            f"edge_clr={self.result['edge_clearance']:.0f}  "
-            f"area={self.result['annular_area']:,}")
+            f"center_dx={r['center_dx']:+.1f}  center_dy={r['center_dy']:+.1f}  "
+            f"max_thick={r['max_thickness']:.1f}  "
+            f"thick_std={r['thickness_std']:.1f}  "
+            f"circ_o={r['circularity_outer']:.4f}  "
+            f"edge_clr={r['edge_clearance']:.0f}  "
+            f"area={self.result['annular_area']:,}  {scale_str}".rstrip())
 
     def _evaluate(self):
         """Compare each metric against thresholds.
@@ -847,16 +916,22 @@ class InspectionGUI(QMainWindow):
             1. REWORK  — any "rework"-category metric fails (shape — fixable)
             2. REJECT  — any "reject"-category metric fails (thickness / size)
             3. PASS    — everything within tolerance
+
+        Uses resolution-normalized measurements so that thresholds
+        (calibrated at REFERENCE_RESOLUTION) apply at any input size.
         """
         if self.result is None:
             return
+
+        # Use normalized measurements for threshold comparison
+        normed = getattr(self, "result_normed", self.result)
 
         self._read_thresholds_from_table()
         rework_fails = []
         reject_fails = []
 
         for row, (key, name, _unit, ttype, dec, *_, category) in enumerate(METRIC_DEFS):
-            val = self.result.get(key)
+            val = normed.get(key)
             if val is None:
                 continue
 
