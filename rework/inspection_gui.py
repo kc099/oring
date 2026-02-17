@@ -28,11 +28,13 @@ import sys
 import csv
 import json
 import math
+import os
 from pathlib import Path
 from typing import Optional, Dict
 
 import cv2
 import numpy as np
+import torch
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -49,6 +51,12 @@ from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
 # ═══════════════════════════════════════════════════════════════════════════
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+WORKSPACE  = SCRIPT_DIR.parent
+
+# ── Mask R-CNN checkpoint (binary mode) ──────────────────────────────────
+MASKRCNN_CHECKPOINT = (
+    WORKSPACE / "maskrcnn" / "dataset" / "combined" / "checkpoints" / "best_model.pth"
+)
 
 # Reference resolution — thresholds are calibrated at this size
 REFERENCE_RESOLUTION = (2448, 2048)   # (width, height) of original camera images
@@ -557,6 +565,12 @@ class InspectionGUI(QMainWindow):
         self.result_normed: Optional[Dict] = None
         self._resolution_scale: float = 1.0
 
+        # Mask R-CNN (lazy-loaded on first PASS verdict)
+        self._detector = None
+        self._pred_overlay: Optional[np.ndarray] = None
+        self._pred_mask: Optional[np.ndarray] = None
+        self._pred_result: Optional[Dict] = None
+
         # Statistics & thresholds
         self.current_model = DEFAULT_MODEL
         self.good_stats = load_good_stats(MODEL_CSV[self.current_model])
@@ -610,6 +624,23 @@ class InspectionGUI(QMainWindow):
         self.mask_label.setStyleSheet(
             "background:#1f1f1f; color:#888; font-size:13px; border-radius:6px;")
         left_lay.addWidget(self.mask_label, stretch=1)
+
+        # Mask R-CNN prediction row (720×720 crop → model)
+        pred_row = QHBoxLayout()
+        self.pred_overlay_label = QLabel("Mask R-CNN prediction (PASS images)")
+        self.pred_overlay_label.setAlignment(Qt.AlignCenter)
+        self.pred_overlay_label.setMinimumHeight(180)
+        self.pred_overlay_label.setStyleSheet(
+            "background:#1a1a2e; color:#666; font-size:11px; border-radius:6px;")
+        pred_row.addWidget(self.pred_overlay_label, stretch=1)
+
+        self.pred_mask_label = QLabel("Predicted defect mask")
+        self.pred_mask_label.setAlignment(Qt.AlignCenter)
+        self.pred_mask_label.setMinimumHeight(180)
+        self.pred_mask_label.setStyleSheet(
+            "background:#1a1a2e; color:#666; font-size:11px; border-radius:6px;")
+        pred_row.addWidget(self.pred_mask_label, stretch=1)
+        left_lay.addLayout(pred_row, stretch=1)
 
         root.addWidget(left, stretch=3)
 
@@ -824,6 +855,106 @@ class InspectionGUI(QMainWindow):
                 "hi": self.hi_spins[key].value(),
             }
 
+    # ── Mask R-CNN helpers ───────────────────────────────────────────────
+
+    def _ensure_detector(self) -> bool:
+        """Lazy-load the Mask R-CNN model. Returns True if ready."""
+        if self._detector is not None:
+            return True
+        if not MASKRCNN_CHECKPOINT.exists():
+            print(f"⚠ Checkpoint not found: {MASKRCNN_CHECKPOINT}")
+            return False
+        try:
+            # Temporarily add maskrcnn dir to path for imports
+            maskrcnn_dir = str(WORKSPACE / "maskrcnn")
+            if maskrcnn_dir not in sys.path:
+                sys.path.insert(0, maskrcnn_dir)
+            from inference import OringDefectDetector
+            self._detector = OringDefectDetector(
+                model_name="combined",
+                checkpoint_path=str(MASKRCNN_CHECKPOINT),
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                score_threshold=0.5,
+                mask_threshold=0.5,
+            )
+            return True
+        except Exception as e:
+            print(f"⚠ Failed to load Mask R-CNN: {e}")
+            return False
+
+    def _bin_crop_720(self, image: np.ndarray) -> np.ndarray:
+        """2×2 bin + BG crop + resize/pad to 720×720 (same as training pipeline)."""
+        # Import from binning_pipeline
+        binning_dir = str(WORKSPACE / "binning_pipeline")
+        if binning_dir not in sys.path:
+            sys.path.insert(0, binning_dir)
+        from bin_and_crop import binning_2x2, crop_to_foreground
+
+        binned = binning_2x2(image)
+        cropped, _info = crop_to_foreground(binned, bg_value=20, threshold=30,
+                                            pad=10, target_size=720)
+        return cropped
+
+    def _run_maskrcnn(self, image_720: np.ndarray) -> Dict:
+        """Run Mask R-CNN prediction on a 720×720 image.
+        Returns prediction dict with boxes, masks, scores, labels, has_defect.
+        """
+        return self._detector.predict(image_720)
+
+    def _run_maskrcnn_on_pass(self):
+        """Called after geometric verdict is PASS.
+        Crop to 720×720, run binary Mask R-CNN, display results.
+        Returns True if defects found (override to REJECT).
+        """
+        if self.image is None:
+            return False
+
+        if not self._ensure_detector():
+            self.pred_overlay_label.setText("⚠ Model not available")
+            self.pred_mask_label.setText("")
+            return False
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            # Bin + crop to 720×720
+            img_720 = self._bin_crop_720(self.image)
+
+            # Run Mask R-CNN
+            pred = self._run_maskrcnn(img_720)
+            self._pred_result = pred
+
+            # Draw prediction overlay
+            maskrcnn_dir = str(WORKSPACE / "maskrcnn")
+            if maskrcnn_dir not in sys.path:
+                sys.path.insert(0, maskrcnn_dir)
+            from utils import draw_predictions
+
+            self._pred_overlay = draw_predictions(
+                img_720, pred["boxes"], pred["masks"],
+                pred["scores"], pred["labels"],
+                score_threshold=0.5, mask_alpha=0.4)
+            self._show_cv(self._pred_overlay, self.pred_overlay_label)
+
+            # Build combined defect mask image
+            h, w = img_720.shape[:2]
+            if pred["num_detections"] > 0:
+                combined_mask = np.zeros((h, w), dtype=np.uint8)
+                for m in pred["masks"]:
+                    combined_mask = np.maximum(combined_mask, m * 255)
+                self._pred_mask = combined_mask
+            else:
+                self._pred_mask = np.zeros((h, w), dtype=np.uint8)
+            self._show_cv(self._pred_mask, self.pred_mask_label)
+
+            return pred["has_defect"]
+        except Exception as e:
+            print(f"⚠ Mask R-CNN inference failed: {e}")
+            import traceback; traceback.print_exc()
+            self.pred_overlay_label.setText(f"⚠ Inference error: {e}")
+            return False
+        finally:
+            QApplication.restoreOverrideCursor()
+
     # ── Actions ──────────────────────────────────────────────────────────
 
     def load_image(self):
@@ -975,6 +1106,14 @@ class InspectionGUI(QMainWindow):
 
         # ── Overall verdict ──────────────────────────────────────────────
         # Check REWORK first (fixable), then REJECT (unfixable)
+        # Clear prediction panels (model only runs on PASS)
+        self.pred_overlay_label.setText("Mask R-CNN prediction (PASS images)")
+        self.pred_overlay_label.setPixmap(QPixmap())
+        self.pred_mask_label.setText("Predicted defect mask")
+        self.pred_mask_label.setPixmap(QPixmap())
+        self._pred_overlay = None
+        self._pred_mask = None
+        self._pred_result = None
         if rework_fails:
             # REWORK — shape issues fixable by trimming
             self.verdict_label.setText("🔧  REWORK")
@@ -1001,13 +1140,34 @@ class InspectionGUI(QMainWindow):
             self.verdict_detail.setStyleSheet("color:#CE93D8;")
 
         else:
-            # PASS — all good
-            self.verdict_label.setText("✅  PASS")
-            self.verdict_label.setStyleSheet("color: white;")
-            self.verdict_frame.setStyleSheet(
-                "background:#2E7D32; border-radius:12px; padding:8px;")
-            self.verdict_detail.setText("All metrics within tolerance")
-            self.verdict_detail.setStyleSheet("color:#C8E6C9;")
+            # Geometric verdict = PASS — run Mask R-CNN for defect confirmation
+            self.pred_overlay_label.setText("Running Mask R-CNN…")
+            self.pred_mask_label.setText("")
+            QApplication.processEvents()  # update UI before blocking inference
+
+            has_defect = self._run_maskrcnn_on_pass()
+
+            if has_defect:
+                # Override: model found defects on a geometrically-passing image
+                n_det = self._pred_result["num_detections"]
+                top_score = max(self._pred_result["scores"]) if n_det > 0 else 0
+                self.verdict_label.setText("⛔  REJECT (AI)")
+                self.verdict_label.setStyleSheet("color: white;")
+                self.verdict_frame.setStyleSheet(
+                    "background:#4A148C; border-radius:12px; padding:8px;")
+                self.verdict_detail.setText(
+                    f"Geometry OK, but Mask R-CNN detected {n_det} defect(s)  "
+                    f"(top score {top_score:.0%})")
+                self.verdict_detail.setStyleSheet("color:#CE93D8;")
+            else:
+                # Confirmed PASS
+                self.verdict_label.setText("✅  PASS")
+                self.verdict_label.setStyleSheet("color: white;")
+                self.verdict_frame.setStyleSheet(
+                    "background:#2E7D32; border-radius:12px; padding:8px;")
+                self.verdict_detail.setText(
+                    "All metrics within tolerance • Mask R-CNN: no defects")
+                self.verdict_detail.setStyleSheet("color:#C8E6C9;")
 
     def _clear_results(self):
         for row in range(self.table.rowCount()):
@@ -1021,6 +1181,14 @@ class InspectionGUI(QMainWindow):
             "background:#555; border-radius:12px; padding:8px;")
         self.verdict_detail.setText("Load an image and click Analyze")
         self.verdict_detail.setStyleSheet("color:#bbb;")
+        # Clear prediction panels
+        self._pred_overlay = None
+        self._pred_mask = None
+        self._pred_result = None
+        self.pred_overlay_label.setText("Mask R-CNN prediction (PASS images)")
+        self.pred_overlay_label.setPixmap(QPixmap())
+        self.pred_mask_label.setText("Predicted defect mask")
+        self.pred_mask_label.setPixmap(QPixmap())
 
     def _on_threshold_edited(self, _=None):
         if self.result is not None:
@@ -1124,6 +1292,10 @@ class InspectionGUI(QMainWindow):
             cv2.drawContours(
                 mask_vis, [self.result["inner_contour"]], -1, (0, 0, 255), 2)
             self._show_cv(mask_vis, self.mask_label)
+        if self._pred_overlay is not None:
+            self._show_cv(self._pred_overlay, self.pred_overlay_label)
+        if self._pred_mask is not None:
+            self._show_cv(self._pred_mask, self.pred_mask_label)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
