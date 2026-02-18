@@ -9,6 +9,7 @@ dataset/
 Original Data/
 oring_crops/
 oring_patches_640/
+oring_linear_patches/
 yolo_dataset/
 yolo_dataset_split/
 yolo_training/runs/
@@ -17,3 +18,5 @@ yolo_training/*.pt
 rework/*.csv
 rework/*.json
 binned/
+Results/
+*.csv
