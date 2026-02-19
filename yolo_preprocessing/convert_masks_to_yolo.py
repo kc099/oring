@@ -123,7 +123,7 @@ def process_dataset(
     print(f"Found {len(mask_mapping)} mask files")
 
     # Build image lists and select samples
-    defect_folder_names = {'notok', 'model1defect'}
+    defect_folder_names = {'notok', 'notok2', 'model1defect', 'model1defect2'}
     good_folder_names = {'good', 'model1good'}
 
     def list_image_files(folder_path: str) -> List[str]:
@@ -167,8 +167,8 @@ def process_dataset(
         selected_images_by_folder[image_folder] = selected
         defect_total += len(selected)
 
-    # Select good images to be half of defect samples
-    good_target = defect_total // 2
+    # Select good images to match defect count (balanced dataset)
+    good_target = defect_total
     good_pool: List[Tuple[str, str]] = []
     for image_folder in source_image_folders:
         if not os.path.exists(image_folder):
@@ -285,21 +285,23 @@ def process_dataset(
 
 def main():
     """Main preprocessing function."""
-    # Define paths
-    dataset_dir = os.path.join(os.path.dirname(__file__), '..', 'dataset')
+    # Define paths - using binned/ folder structure
+    binned_dir = os.path.join(os.path.dirname(__file__), '..', 'binned')
 
     source_image_folders = [
-        os.path.join(dataset_dir, 'images', 'model1defect'),
-        os.path.join(dataset_dir, 'images', 'notok'),
-        os.path.join(dataset_dir, 'images', 'good'),
-        os.path.join(dataset_dir, 'images', 'model1good')
+        os.path.join(binned_dir, 'notok'),
+        os.path.join(binned_dir, 'notok2'),
+        os.path.join(binned_dir, 'model1defect'),
+        os.path.join(binned_dir, 'model1defect2'),
+        os.path.join(binned_dir, 'good'),
+        os.path.join(binned_dir, 'model1good'),
     ]
 
     source_mask_folders = [
-        os.path.join(dataset_dir, 'labels', 'model1defect'),
-        os.path.join(dataset_dir, 'labels', 'notok'),
-        os.path.join(dataset_dir, 'labels', 'good'),
-        os.path.join(dataset_dir, 'labels', 'model1good')
+        os.path.join(binned_dir, 'masks', 'notok'),
+        os.path.join(binned_dir, 'masks', 'notok2'),
+        os.path.join(binned_dir, 'masks', 'model1defect'),
+        os.path.join(binned_dir, 'masks', 'model1defect2'),
     ]
 
     output_dir = os.path.join(os.path.dirname(__file__), '..', 'yolo_dataset')

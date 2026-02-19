@@ -59,9 +59,9 @@ def main():
     logger.info("\n")
     
     steps = [
-        ("prepare_dataset.py", "STEP 1: Preparing Dataset (Train/Val/Test Split)"),
-        ("train_yolo.py", "STEP 2: Training YOLO Segmentation Model"),
-        ("inference.py", "STEP 3: Running Inference & Evaluation"),
+        (os.path.join('..', 'yolo_preprocessing', 'convert_masks_to_yolo.py'), "STEP 1: Converting Masks to YOLO Format"),
+        ("prepare_dataset.py", "STEP 2: Preparing Dataset (Train/Val/Test Split)"),
+        ("train_yolo.py", "STEP 3: Training YOLO Segmentation Model"),
     ]
     
     failed_steps = []

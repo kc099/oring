@@ -370,7 +370,7 @@ def main():
     model_name = 'yolov8m-seg'  # Options: yolov8n-seg, yolov8s-seg, yolov8m-seg, yolov8l-seg, yolov8x-seg
     epochs = 100
     batch_size = 8
-    imgsz = 640
+    imgsz = 720
     
     # Train
     results = trainer.train(

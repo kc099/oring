@@ -15,7 +15,7 @@ MODEL_CONFIG = {
 TRAINING_CONFIG = {
     'epochs': 100,
     'batch_size': 8,  # Adjust based on GPU memory
-    'imgsz': 640,  # Input image size
+    'imgsz': 720,  # Input image size (720x720 binned images)
     'patience': 20,  # Early stopping patience
     'device': 0,  # GPU device (0 for first GPU, 'cpu' for CPU)
     'workers': 4,  # Data loader workers

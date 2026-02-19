@@ -58,6 +58,14 @@ MASKRCNN_CHECKPOINT = (
     WORKSPACE / "maskrcnn" / "dataset" / "combined" / "checkpoints" / "best_model.pth"
 )
 
+# ── YOLO v11 segmentation checkpoint ─────────────────────────────────────
+YOLO_CHECKPOINT = (
+    WORKSPACE / "yolo_training" / "runs" / "yolo11n-seg_training2" / "weights" / "best.pt"
+)
+
+# Defect detection model options
+DEFECT_MODEL_OPTIONS = ["Mask R-CNN", "YOLO v11"]
+
 # Reference resolution — thresholds are calibrated at this size
 REFERENCE_RESOLUTION = (2448, 2048)   # (width, height) of original camera images
 
@@ -565,11 +573,17 @@ class InspectionGUI(QMainWindow):
         self.result_normed: Optional[Dict] = None
         self._resolution_scale: float = 1.0
 
-        # Mask R-CNN (lazy-loaded on first PASS verdict)
-        self._detector = None
+        # Defect detection models (lazy-loaded on first PASS verdict)
+        self._detector = None          # Mask R-CNN
+        self._yolo_detector = None     # YOLO v11
+        self._defect_model = "Mask R-CNN"  # Current selection
         self._pred_overlay: Optional[np.ndarray] = None
         self._pred_mask: Optional[np.ndarray] = None
         self._pred_result: Optional[Dict] = None
+
+        # File navigation
+        self._file_list: list = []   # sorted image paths in current folder
+        self._file_index: int = -1   # current index in _file_list
 
         # Statistics & thresholds
         self.current_model = DEFAULT_MODEL
@@ -627,7 +641,7 @@ class InspectionGUI(QMainWindow):
 
         # Mask R-CNN prediction row (720×720 crop → model)
         pred_row = QHBoxLayout()
-        self.pred_overlay_label = QLabel("Mask R-CNN prediction (PASS images)")
+        self.pred_overlay_label = QLabel("Defect model prediction (PASS images)")
         self.pred_overlay_label.setAlignment(Qt.AlignCenter)
         self.pred_overlay_label.setMinimumHeight(180)
         self.pred_overlay_label.setStyleSheet(
@@ -679,6 +693,26 @@ class InspectionGUI(QMainWindow):
         btn_row.addWidget(self.analyze_btn)
         sl.addLayout(btn_row)
 
+        # Navigation buttons
+        nav_row = QHBoxLayout()
+        self.prev_btn = QPushButton("◀ Prev")
+        self.prev_btn.setEnabled(False)
+        self.prev_btn.setStyleSheet("font-size:13px; padding:6px 14px;")
+        self.prev_btn.clicked.connect(self._load_prev_image)
+        nav_row.addWidget(self.prev_btn)
+
+        self.nav_label = QLabel("")
+        self.nav_label.setAlignment(Qt.AlignCenter)
+        self.nav_label.setStyleSheet("color:#aaa; font-size:12px;")
+        nav_row.addWidget(self.nav_label)
+
+        self.next_btn = QPushButton("Next ▶")
+        self.next_btn.setEnabled(False)
+        self.next_btn.setStyleSheet("font-size:13px; padding:6px 14px;")
+        self.next_btn.clicked.connect(self._load_next_image)
+        nav_row.addWidget(self.next_btn)
+        sl.addLayout(nav_row)
+
         param_row = QHBoxLayout()
         param_row.addWidget(QLabel("BG Value:"))
         self.bg_spin = QSpinBox()
@@ -699,6 +733,17 @@ class InspectionGUI(QMainWindow):
         self.thresh_spin.setValue(30)
         param_row.addWidget(self.thresh_spin)
         sl.addLayout(param_row)
+
+        # Defect detection model selector
+        defect_model_row = QHBoxLayout()
+        defect_model_row.addWidget(QLabel("Defect Model:"))
+        self.defect_model_combo = QComboBox()
+        self.defect_model_combo.addItems(DEFECT_MODEL_OPTIONS)
+        self.defect_model_combo.setCurrentText(self._defect_model)
+        self.defect_model_combo.currentTextChanged.connect(self._on_defect_model_changed)
+        self.defect_model_combo.setStyleSheet("padding:3px 8px; font-size:13px;")
+        defect_model_row.addWidget(self.defect_model_combo)
+        sl.addLayout(defect_model_row)
 
         sg.setLayout(sl)
         right_lay.addWidget(sg)
@@ -855,6 +900,122 @@ class InspectionGUI(QMainWindow):
                 "hi": self.hi_spins[key].value(),
             }
 
+    # ── Defect model selection ────────────────────────────────────────────
+
+    def _on_defect_model_changed(self, model_name: str):
+        """Called when user changes defect model dropdown."""
+        self._defect_model = model_name
+        print(f"Defect model changed to: {model_name}")
+
+    # ── YOLO v11 helpers ─────────────────────────────────────────────────
+
+    def _ensure_yolo_detector(self) -> bool:
+        """Lazy-load the YOLO v11 model. Returns True if ready."""
+        if self._yolo_detector is not None:
+            return True
+        if not YOLO_CHECKPOINT.exists():
+            print(f"⚠ YOLO checkpoint not found: {YOLO_CHECKPOINT}")
+            return False
+        try:
+            from ultralytics import YOLO as UltralyticsYOLO
+            self._yolo_detector = UltralyticsYOLO(str(YOLO_CHECKPOINT))
+            return True
+        except Exception as e:
+            print(f"⚠ Failed to load YOLO v11: {e}")
+            return False
+
+    def _run_yolo_on_pass(self):
+        """Called after geometric verdict is PASS (YOLO v11 mode).
+        Crop to 720×720, run YOLO segmentation, display results.
+        Returns True if defects found (override to REJECT).
+        """
+        if self.image is None:
+            return False
+
+        if not self._ensure_yolo_detector():
+            self.pred_overlay_label.setText("⚠ YOLO v11 model not available")
+            self.pred_mask_label.setText("")
+            return False
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            # Bin + crop to 720×720
+            img_720 = self._bin_crop_720(self.image)
+
+            # Run YOLO inference
+            results = self._yolo_detector.predict(
+                img_720, conf=0.5, iou=0.45, verbose=False,
+                device="cuda" if torch.cuda.is_available() else "cpu"
+            )
+            result = results[0]
+
+            # Extract detections
+            boxes = result.boxes
+            num_det = len(boxes) if boxes is not None else 0
+            has_defect = num_det > 0
+
+            scores = boxes.conf.cpu().numpy().tolist() if num_det > 0 else []
+            labels = boxes.cls.cpu().numpy().astype(int).tolist() if num_det > 0 else []
+
+            # Build prediction result dict (compatible with existing code)
+            self._pred_result = {
+                "num_detections": num_det,
+                "has_defect": has_defect,
+                "scores": scores,
+                "labels": labels,
+            }
+
+            # Draw overlay with predictions
+            overlay = img_720.copy()
+            h, w = img_720.shape[:2]
+            combined_mask = np.zeros((h, w), dtype=np.uint8)
+
+            if result.masks is not None and num_det > 0:
+                masks_data = result.masks.data.cpu().numpy()  # (N, H, W)
+                for i in range(num_det):
+                    mask_i = cv2.resize(
+                        masks_data[i], (w, h),
+                        interpolation=cv2.INTER_LINEAR
+                    )
+                    binary = (mask_i > 0.5).astype(np.uint8)
+                    combined_mask = np.maximum(combined_mask, binary * 255)
+
+                    # Draw mask overlay
+                    color_mask = np.zeros_like(overlay)
+                    color_mask[:, :, 2] = binary * 255  # Red channel
+                    overlay = cv2.addWeighted(overlay, 1.0, color_mask, 0.4, 0)
+
+                    # Draw contours
+                    contours, _ = cv2.findContours(
+                        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(overlay, contours, -1, (0, 0, 255), 2)
+
+                    # Draw score
+                    if len(contours) > 0:
+                        M = cv2.moments(contours[0])
+                        if M["m00"] > 0:
+                            cx = int(M["m10"] / M["m00"])
+                            cy = int(M["m01"] / M["m00"])
+                            cv2.putText(overlay, f"{scores[i]:.0%}",
+                                        (cx - 20, cy),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                        (255, 255, 255), 2)
+
+            self._pred_overlay = overlay
+            self._show_cv(overlay, self.pred_overlay_label)
+
+            self._pred_mask = combined_mask
+            self._show_cv(combined_mask, self.pred_mask_label)
+
+            return has_defect
+        except Exception as e:
+            print(f"⚠ YOLO v11 inference failed: {e}")
+            import traceback; traceback.print_exc()
+            self.pred_overlay_label.setText(f"⚠ YOLO inference error: {e}")
+            return False
+        finally:
+            QApplication.restoreOverrideCursor()
+
     # ── Mask R-CNN helpers ───────────────────────────────────────────────
 
     def _ensure_detector(self) -> bool:
@@ -977,6 +1138,21 @@ class InspectionGUI(QMainWindow):
         self.analyze_btn.setEnabled(True)
         self._clear_results()
 
+        # Build file list for navigation
+        folder = str(Path(path).parent)
+        exts = {'.bmp', '.jpg', '.jpeg', '.png', '.tiff'}
+        files = sorted(
+            [os.path.join(folder, f) for f in os.listdir(folder)
+             if Path(f).suffix.lower() in exts],
+            key=lambda p: Path(p).name.lower()
+        )
+        self._file_list = files
+        try:
+            self._file_index = files.index(os.path.normpath(path))
+        except ValueError:
+            self._file_index = 0
+        self._update_nav_buttons()
+
         h, w = img.shape[:2]
         self.info_label.setText(f"Loaded: {Path(path).name}  ({w}×{h})")
         self.setWindowTitle(f"O-Ring Inspection — {Path(path).name}")
@@ -989,6 +1165,52 @@ class InspectionGUI(QMainWindow):
         self.bg_spin.setValue(val)
         self.info_label.setText(
             f"Auto BG: median corner intensity = {val}")
+
+    # ── File navigation ──────────────────────────────────────────────────
+
+    def _update_nav_buttons(self):
+        """Enable/disable prev/next buttons and update counter label."""
+        n = len(self._file_list)
+        idx = self._file_index
+        self.prev_btn.setEnabled(idx > 0)
+        self.next_btn.setEnabled(idx < n - 1)
+        if n > 0:
+            self.nav_label.setText(f"{idx + 1} / {n}")
+        else:
+            self.nav_label.setText("")
+
+    def _load_image_at_index(self, index: int):
+        """Load an image by index from the current file list."""
+        if index < 0 or index >= len(self._file_list):
+            return
+        path = self._file_list[index]
+        img = cv2.imread(path)
+        if img is None:
+            QMessageBox.warning(self, "Error", f"Cannot read:\n{path}")
+            return
+
+        self._file_index = index
+        self.image = img
+        self.overlay_image = None
+        self.result = None
+        self._show_cv(img, self.img_label)
+        self.mask_label.setText("Click  🔍 Analyze  to process")
+        self.mask_label.setPixmap(QPixmap())
+        self.analyze_btn.setEnabled(True)
+        self._clear_results()
+        self._update_nav_buttons()
+
+        h, w = img.shape[:2]
+        self.info_label.setText(f"Loaded: {Path(path).name}  ({w}×{h})")
+        self.setWindowTitle(f"O-Ring Inspection — {Path(path).name}")
+
+    def _load_prev_image(self):
+        """Navigate to the previous image in the folder."""
+        self._load_image_at_index(self._file_index - 1)
+
+    def _load_next_image(self):
+        """Navigate to the next image in the folder."""
+        self._load_image_at_index(self._file_index + 1)
 
     def analyze(self):
         if self.image is None:
@@ -1107,7 +1329,7 @@ class InspectionGUI(QMainWindow):
         # ── Overall verdict ──────────────────────────────────────────────
         # Check REWORK first (fixable), then REJECT (unfixable)
         # Clear prediction panels (model only runs on PASS)
-        self.pred_overlay_label.setText("Mask R-CNN prediction (PASS images)")
+        self.pred_overlay_label.setText(f"{self._defect_model} prediction (PASS images)")
         self.pred_overlay_label.setPixmap(QPixmap())
         self.pred_mask_label.setText("Predicted defect mask")
         self.pred_mask_label.setPixmap(QPixmap())
@@ -1140,12 +1362,16 @@ class InspectionGUI(QMainWindow):
             self.verdict_detail.setStyleSheet("color:#CE93D8;")
 
         else:
-            # Geometric verdict = PASS — run Mask R-CNN for defect confirmation
-            self.pred_overlay_label.setText("Running Mask R-CNN…")
+            # Geometric verdict = PASS — run defect model for confirmation
+            model_name = self._defect_model
+            self.pred_overlay_label.setText(f"Running {model_name}…")
             self.pred_mask_label.setText("")
             QApplication.processEvents()  # update UI before blocking inference
 
-            has_defect = self._run_maskrcnn_on_pass()
+            if model_name == "YOLO v11":
+                has_defect = self._run_yolo_on_pass()
+            else:
+                has_defect = self._run_maskrcnn_on_pass()
 
             if has_defect:
                 # Override: model found defects on a geometrically-passing image
@@ -1156,7 +1382,7 @@ class InspectionGUI(QMainWindow):
                 self.verdict_frame.setStyleSheet(
                     "background:#4A148C; border-radius:12px; padding:8px;")
                 self.verdict_detail.setText(
-                    f"Geometry OK, but Mask R-CNN detected {n_det} defect(s)  "
+                    f"Geometry OK, but {model_name} detected {n_det} defect(s)  "
                     f"(top score {top_score:.0%})")
                 self.verdict_detail.setStyleSheet("color:#CE93D8;")
             else:
@@ -1166,7 +1392,7 @@ class InspectionGUI(QMainWindow):
                 self.verdict_frame.setStyleSheet(
                     "background:#2E7D32; border-radius:12px; padding:8px;")
                 self.verdict_detail.setText(
-                    "All metrics within tolerance • Mask R-CNN: no defects")
+                    f"All metrics within tolerance • {model_name}: no defects")
                 self.verdict_detail.setStyleSheet("color:#C8E6C9;")
 
     def _clear_results(self):
@@ -1185,7 +1411,7 @@ class InspectionGUI(QMainWindow):
         self._pred_overlay = None
         self._pred_mask = None
         self._pred_result = None
-        self.pred_overlay_label.setText("Mask R-CNN prediction (PASS images)")
+        self.pred_overlay_label.setText(f"{self._defect_model} prediction (PASS images)")
         self.pred_overlay_label.setPixmap(QPixmap())
         self.pred_mask_label.setText("Predicted defect mask")
         self.pred_mask_label.setPixmap(QPixmap())
