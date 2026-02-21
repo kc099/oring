@@ -42,8 +42,18 @@ from PySide6.QtWidgets import (
     QGroupBox, QDoubleSpinBox, QSpinBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QFrame, QComboBox,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
+
+# ── Hikrobot Camera SDK (optional — only needed for live camera) ─────────
+try:
+    _MV_DLL_PATH = r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64"
+    if os.path.isdir(_MV_DLL_PATH):
+        os.add_dll_directory(_MV_DLL_PATH)
+    from MvImport.MvCameraControl_class import *   # noqa
+    HIKROBOT_AVAILABLE = True
+except Exception:
+    HIKROBOT_AVAILABLE = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -581,6 +591,12 @@ class InspectionGUI(QMainWindow):
         self._pred_mask: Optional[np.ndarray] = None
         self._pred_result: Optional[Dict] = None
 
+        # Camera (Hikrobot)
+        self._camera = None
+        self._camera_streaming = False
+        self._stream_timer: Optional[QTimer] = None
+        self._latest_frame: Optional[np.ndarray] = None
+
         # File navigation
         self._file_list: list = []   # sorted image paths in current folder
         self._file_index: int = -1   # current index in _file_list
@@ -712,6 +728,22 @@ class InspectionGUI(QMainWindow):
         self.next_btn.clicked.connect(self._load_next_image)
         nav_row.addWidget(self.next_btn)
         sl.addLayout(nav_row)
+
+        # Camera controls
+        cam_row = QHBoxLayout()
+        self.stream_btn = QPushButton("📷 Start Stream")
+        self.stream_btn.setStyleSheet("font-size:13px; padding:6px 14px;")
+        self.stream_btn.clicked.connect(self._toggle_stream)
+        cam_row.addWidget(self.stream_btn)
+
+        self.capture_btn = QPushButton("📸 Capture")
+        self.capture_btn.setEnabled(False)
+        self.capture_btn.setStyleSheet(
+            "font-size:13px; padding:6px 14px; "
+            "background:#1976D2; color:white; font-weight:bold;")
+        self.capture_btn.clicked.connect(self._capture_frame)
+        cam_row.addWidget(self.capture_btn)
+        sl.addLayout(cam_row)
 
         param_row = QHBoxLayout()
         param_row.addWidget(QLabel("BG Value:"))
@@ -1487,6 +1519,211 @@ class InspectionGUI(QMainWindow):
         self._sync_thresholds_to_table()
         if self.result is not None:
             self._evaluate()
+
+    # ── Camera helpers (Hikrobot) ─────────────────────────────────────────
+
+    def _init_camera(self) -> bool:
+        """Enumerate Hikrobot devices, create handle, open the first camera."""
+        if not HIKROBOT_AVAILABLE:
+            QMessageBox.warning(
+                self, "Camera Error",
+                "Hikrobot SDK not available.\n"
+                "Install the MVS SDK and ensure MvImport is on the Python path.")
+            return False
+        if self._camera is not None:
+            return True  # already initialised
+
+        try:
+            deviceList = MV_CC_DEVICE_INFO_LIST()
+            tlayerType = MV_GIGE_DEVICE | MV_USB_DEVICE
+            ret = MvCamera.MV_CC_EnumDevices(tlayerType, deviceList)
+            if ret != 0 or deviceList.nDeviceNum == 0:
+                QMessageBox.warning(self, "Camera Error", "No Hikrobot cameras found!")
+                return False
+
+            self._camera = MvCamera()
+            stDevInfo = cast(
+                deviceList.pDeviceInfo[0], POINTER(MV_CC_DEVICE_INFO)).contents
+            ret = self._camera.MV_CC_CreateHandle(stDevInfo)
+            if ret != 0:
+                self._camera = None
+                QMessageBox.warning(
+                    self, "Camera Error", f"CreateHandle failed (0x{ret:08X})")
+                return False
+
+            ret = self._camera.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
+            if ret != 0:
+                self._camera.MV_CC_DestroyHandle()
+                self._camera = None
+                QMessageBox.warning(
+                    self, "Camera Error", f"OpenDevice failed (0x{ret:08X})")
+                return False
+
+            # Free-run mode (no hardware trigger)
+            self._camera.MV_CC_SetEnumValue("TriggerMode", 0)
+            return True
+
+        except Exception as e:
+            self._camera = None
+            QMessageBox.warning(
+                self, "Camera Error", f"Camera initialisation failed:\n{e}")
+            return False
+
+    def _toggle_stream(self):
+        """Toggle camera live stream on / off."""
+        if self._camera_streaming:
+            self._stop_stream()
+        else:
+            self._start_stream()
+
+    def _start_stream(self):
+        """Open camera (if needed), start grabbing, start preview timer."""
+        if not self._init_camera():
+            return
+        if self._camera_streaming:
+            return
+
+        ret = self._camera.MV_CC_StartGrabbing()
+        if ret != 0:
+            QMessageBox.warning(
+                self, "Camera Error", f"StartGrabbing failed (0x{ret:08X})")
+            return
+
+        self._camera_streaming = True
+        self.stream_btn.setText("⏹ Stop Stream")
+        self.capture_btn.setEnabled(True)
+        self.load_btn.setEnabled(False)
+        self.analyze_btn.setEnabled(False)
+
+        if self._stream_timer is None:
+            self._stream_timer = QTimer(self)
+            self._stream_timer.timeout.connect(self._update_stream_preview)
+        self._stream_timer.start(66)   # ~15 fps preview
+        self.info_label.setText("Camera streaming — press Capture to grab a frame")
+
+    def _stop_stream(self):
+        """Stop preview timer and camera grabbing."""
+        if self._stream_timer is not None:
+            self._stream_timer.stop()
+        if self._camera is not None and self._camera_streaming:
+            self._camera.MV_CC_StopGrabbing()
+        self._camera_streaming = False
+        self.stream_btn.setText("📷 Start Stream")
+        self.capture_btn.setEnabled(False)
+        self.load_btn.setEnabled(True)
+
+    def _grab_frame(self) -> Optional[np.ndarray]:
+        """Grab a single frame from the camera.
+
+        Returns a BGR numpy array or None on failure.
+        """
+        if self._camera is None or not self._camera_streaming:
+            return None
+
+        stOutFrame = MV_FRAME_OUT()
+        memset(byref(stOutFrame), 0, sizeof(stOutFrame))
+
+        ret = self._camera.MV_CC_GetImageBuffer(stOutFrame, 1000)
+        if ret != 0:
+            return None
+
+        try:
+            buf_len = stOutFrame.stFrameInfo.nFrameLen
+            pData = (c_ubyte * buf_len).from_address(stOutFrame.pBufAddr)
+            raw = np.frombuffer(pData, dtype=np.uint8).copy()
+
+            h = stOutFrame.stFrameInfo.nHeight
+            w = stOutFrame.stFrameInfo.nWidth
+            px = stOutFrame.stFrameInfo.enPixelType
+
+            # ── Pixel-format conversion to BGR ────────────────────────────
+            if px == 0x01080001:          # Mono8
+                frame = raw.reshape(h, w)
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            elif px == 0x01080009:        # BayerRG8
+                frame = raw.reshape(h, w)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+            elif px == 0x0108000A:        # BayerGB8
+                frame = raw.reshape(h, w)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BayerGB2BGR)
+            elif px == 0x0108000B:        # BayerGR8
+                frame = raw.reshape(h, w)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BayerGR2BGR)
+            elif px == 0x01080008:        # BayerBG8
+                frame = raw.reshape(h, w)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BayerBG2BGR)
+            elif px == 0x02180014:        # RGB8
+                frame = raw.reshape(h, w, 3)
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            elif px == 0x02180015:        # BGR8
+                frame = raw.reshape(h, w, 3)
+            else:
+                # Fallback — treat as single-channel
+                try:
+                    frame = raw.reshape(h, w)
+                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                except ValueError:
+                    frame = raw.reshape(h, w, -1)[:, :, :3].copy()
+            return frame
+        finally:
+            self._camera.MV_CC_FreeImageBuffer(stOutFrame)
+
+    def _update_stream_preview(self):
+        """QTimer callback — grab a frame and show it in the preview."""
+        frame = self._grab_frame()
+        if frame is not None:
+            self._latest_frame = frame
+            self._show_cv(frame, self.img_label)
+
+    def _capture_frame(self):
+        """Freeze the current live frame and load it for analysis."""
+        if not self._camera_streaming:
+            QMessageBox.information(
+                self, "No Stream", "Start the camera stream first.")
+            return
+
+        # Stop the stream so the user can work with a still image
+        self._stop_stream()
+
+        frame = self._latest_frame
+        if frame is None:
+            QMessageBox.warning(
+                self, "Capture Error", "No frame available from the camera.")
+            return
+
+        self.image = frame
+        self.overlay_image = None
+        self.result = None
+        self._show_cv(frame, self.img_label)
+        self.mask_label.setText("Click  🔍 Analyze  to process")
+        self.mask_label.setPixmap(QPixmap())
+        self.analyze_btn.setEnabled(True)
+        self._clear_results()
+
+        # Clear file navigation (this is from camera, not a file)
+        self._file_list = []
+        self._file_index = -1
+        self._update_nav_buttons()
+
+        h, w = frame.shape[:2]
+        self.info_label.setText(f"Captured from camera  ({w}×{h})")
+        self.setWindowTitle("O-Ring Inspection — Camera Capture")
+
+    def _release_camera(self):
+        """Release all camera resources."""
+        self._stop_stream()
+        if self._camera is not None:
+            try:
+                self._camera.MV_CC_CloseDevice()
+                self._camera.MV_CC_DestroyHandle()
+            except Exception:
+                pass
+            self._camera = None
+
+    def closeEvent(self, event):
+        """Ensure camera is released when the window is closed."""
+        self._release_camera()
+        super().closeEvent(event)
 
     # ── Display helpers ──────────────────────────────────────────────────
 
