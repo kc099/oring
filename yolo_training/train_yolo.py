@@ -52,7 +52,8 @@ class YOLOSegmentationTrainer:
     
     def train(
         self,
-        model_name: str = 'yolov8m-seg',
+        model_name: str = 'yolo26n-seg',
+        fallback_model_name: str = 'yolo11n-seg',
         epochs: int = 100,
         imgsz: int = 640,
         batch_size: int = 16,
@@ -68,7 +69,8 @@ class YOLOSegmentationTrainer:
         Train the YOLO segmentation model.
         
         Args:
-            model_name: Model size ('yolov8n-seg', 'yolov8s-seg', 'yolov8m-seg', 'yolov8l-seg')
+            model_name: Primary model ('yolo26n-seg')
+            fallback_model_name: Fallback if primary unavailable ('yolo11n-seg')
             epochs: Number of training epochs
             imgsz: Input image size
             batch_size: Batch size
@@ -93,9 +95,9 @@ class YOLOSegmentationTrainer:
             device = self.device
         
         logger.info("=" * 80)
-        logger.info("YOLO v8 Segmentation Model Training")
+        logger.info("YOLO Segmentation Model Training")
         logger.info("=" * 80)
-        logger.info(f"Model: {model_name}")
+        logger.info(f"Model: {model_name} (fallback: {fallback_model_name})")
         logger.info(f"Epochs: {epochs}")
         logger.info(f"Image size: {imgsz}")
         logger.info(f"Batch size: {batch_size}")
@@ -111,13 +113,20 @@ class YOLOSegmentationTrainer:
         logger.info("  - Resume with: python train_yolo.py --resume")
         logger.info("=" * 80)
         
-        # Load model
+        # Load model (try primary, fall back to secondary)
+        effective_model = model_name
         if resume:
             logger.info("Resuming training from last checkpoint...")
             model = YOLO(f'{model_name}.pt')
         else:
-            logger.info(f"Loading model: {model_name}")
-            model = YOLO(f'{model_name}.pt')
+            try:
+                logger.info(f"Loading primary model: {model_name}")
+                model = YOLO(f'{model_name}.pt')
+            except Exception as e:
+                logger.warning(f"Primary model '{model_name}' not available: {e}")
+                logger.info(f"Falling back to: {fallback_model_name}")
+                model = YOLO(f'{fallback_model_name}.pt')
+                effective_model = fallback_model_name
 
         def save_ground_truth(sampled_files: list, val_images_dir: str, val_labels_dir: str, output_dir: str):
             os.makedirs(output_dir, exist_ok=True)
@@ -281,7 +290,7 @@ class YOLOSegmentationTrainer:
             'save_period': save_period,
             'resume': resume,
             'project': self.output_dir,
-            'name': f'{model_name}_training',
+            'name': f'{effective_model}_training',
             'exist_ok': True if resume else False,
             'verbose': True,
             'plots': True,
@@ -289,10 +298,10 @@ class YOLOSegmentationTrainer:
             'hsv_h': 0.015,  # Image HSV-Hue augmentation
             'hsv_s': 0.7,    # Image HSV-Saturation augmentation
             'hsv_v': 0.4,    # Image HSV-Value augmentation
-            'degrees': 10.0,  # Image rotation (+/- deg)
+            'degrees': 180.0,  # Image rotation (+/- deg) — full range for rotation invariance
             'translate': 0.1,  # Image translation (+/- fraction)
             'scale': 0.5,     # Image scale (+/- gain)
-            'flipud': 0.0,    # Image flip up-down (probability)
+            'flipud': 0.5,    # Image flip up-down (probability)
             'fliplr': 0.5,    # Image flip left-right (probability)
             'mosaic': 1.0,    # Image mosaic (probability)
             'mixup': 0.0,     # Image mixup (probability)
@@ -367,7 +376,8 @@ def main():
     )
     
     # Training parameters
-    model_name = 'yolov8m-seg'  # Options: yolov8n-seg, yolov8s-seg, yolov8m-seg, yolov8l-seg, yolov8x-seg
+    model_name = 'yolo26n-seg'          # Primary model (Jan 2026)
+    fallback_model_name = 'yolo11n-seg'  # Fallback if primary unavailable
     epochs = 100
     batch_size = 8
     imgsz = 720
@@ -375,6 +385,7 @@ def main():
     # Train
     results = trainer.train(
         model_name=model_name,
+        fallback_model_name=fallback_model_name,
         epochs=epochs,
         imgsz=imgsz,
         batch_size=batch_size,

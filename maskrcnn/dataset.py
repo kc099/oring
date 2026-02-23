@@ -127,15 +127,23 @@ class OringDefectDataset(Dataset):
 
         # Handle images with no annotations (good images)
         if len(boxes) == 0:
-            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            boxes = tv_tensors.BoundingBoxes(
+                torch.zeros((0, 4), dtype=torch.float32),
+                format=tv_tensors.BoundingBoxFormat.XYXY,
+                canvas_size=(h, w),
+            )
             labels = torch.zeros((0,), dtype=torch.int64)
-            masks = torch.zeros((0, h, w), dtype=torch.uint8)
+            masks = tv_tensors.Mask(torch.zeros((0, h, w), dtype=torch.uint8))
             areas = torch.zeros((0,), dtype=torch.float32)
             iscrowd = torch.zeros((0,), dtype=torch.int64)
         else:
-            boxes = torch.as_tensor(boxes, dtype=torch.float32)
+            boxes = tv_tensors.BoundingBoxes(
+                torch.as_tensor(boxes, dtype=torch.float32),
+                format=tv_tensors.BoundingBoxFormat.XYXY,
+                canvas_size=(h, w),
+            )
             labels = torch.as_tensor(labels, dtype=torch.int64)
-            masks = torch.as_tensor(np.array(masks), dtype=torch.uint8)
+            masks = tv_tensors.Mask(torch.as_tensor(np.array(masks), dtype=torch.uint8))
             areas = torch.as_tensor(areas, dtype=torch.float32)
             iscrowd = torch.as_tensor(iscrowd, dtype=torch.int64)
 
@@ -148,8 +156,10 @@ class OringDefectDataset(Dataset):
             "iscrowd": iscrowd,
         }
 
-        # Convert image to tensor
+        # Convert image to tv_tensors.Image so v2 transforms
+        # can jointly transform image + boxes + masks together
         image = torch.as_tensor(image, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        image = tv_tensors.Image(image)
 
         # Apply transforms
         if self.transforms is not None:
@@ -159,11 +169,31 @@ class OringDefectDataset(Dataset):
 
 
 def get_train_transforms(cfg) -> T.Compose:
-    """Training augmentations using torchvision v2 transforms."""
+    """Training augmentations using torchvision v2 transforms.
+
+    Includes random rotation so the model learns to detect defects
+    regardless of part orientation (addresses field observation that
+    predictions vary when the same o-ring is rotated in place).
+
+    Requires that image is wrapped in ``tv_tensors.Image``, boxes in
+    ``tv_tensors.BoundingBoxes``, and masks in ``tv_tensors.Mask``
+    so that v2 transforms apply the *same* geometric operation to
+    image, boxes, and masks jointly.
+    """
     transforms = [
         T.RandomHorizontalFlip(p=cfg.horizontal_flip_prob),
         T.RandomVerticalFlip(p=cfg.vertical_flip_prob),
     ]
+    # Random rotation — full 360° to handle any placement orientation
+    rot_deg = getattr(cfg, "rotation_degrees", 15)
+    if rot_deg > 0:
+        transforms.append(
+            T.RandomRotation(
+                degrees=rot_deg,
+                interpolation=T.InterpolationMode.BILINEAR,
+                expand=False,          # keep original canvas size
+            )
+        )
     if cfg.brightness_jitter > 0 or cfg.contrast_jitter > 0:
         transforms.append(
             T.ColorJitter(
@@ -171,6 +201,10 @@ def get_train_transforms(cfg) -> T.Compose:
                 contrast=cfg.contrast_jitter
             )
         )
+    # Clamp boxes inside canvas and remove degenerate ones
+    # (rotation can push boxes partially outside the image)
+    transforms.append(T.ClampBoundingBoxes())
+    transforms.append(T.SanitizeBoundingBoxes(min_size=1))
     return T.Compose(transforms)
 
 

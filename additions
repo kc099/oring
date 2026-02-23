@@ -2,3 +2,10 @@ cut,
 hole, 
 tear,
 foreign object,
+
+Issues:
+
+Rotation during training
+
+Rotational invariance in reject parameters.
+Recalculate rework and reject parameters. 

@@ -121,7 +121,7 @@ class TrainingConfig:
     # Augmentation
     horizontal_flip_prob: float = 0.5
     vertical_flip_prob: float = 0.5
-    rotation_degrees: int = 15
+    rotation_degrees: int = 180          # full rotation range (combined with flips → all orientations)
     brightness_jitter: float = 0.2
     contrast_jitter: float = 0.2
 

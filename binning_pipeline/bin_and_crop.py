@@ -45,12 +45,14 @@ TARGET_SIZE = 720      # fixed output size (720×720)
 
 WORKSPACE = Path(__file__).resolve().parent.parent
 DEFAULT_PAIRS = [
-    ("Original Data/model1defect2", "binned/model1defect2"),
-    ("Original Data/notok2",        "binned/notok2"),
-    ("Original Data/notok",        "binned/notok"),
-    ("Original Data/model1good",   "binned/model1good"),
-    ("Original Data/good",         "binned/good"),
-    ("Original Data/model1defect", "binned/model1defect"),
+    # ("Original Data/model1defect2", "binned/model1defect2"),
+    # ("Original Data/notok2",        "binned/notok2"),
+    ("Original Data/notok3",        "binned/notok3"),
+    # ("Original Data/notok",        "binned/notok"),
+    # ("Original Data/model1good",   "binned/model1good"),
+    # ("Original Data/good",         "binned/good"),
+    # ("Original Data/model1defect", "binned/model1defect"),
+    ("Original Data/model1defect3", "binned/model1defect3"),
 ]
 
 

@@ -111,9 +111,14 @@ def build_mask(image: np.ndarray) -> np.ndarray:
 
 
 def find_contours(mask: np.ndarray):
-    """Return (outer, inner) contours of the ring."""
+    """Return (outer, inner) contours of the ring.
+
+    Uses CHAIN_APPROX_NONE for uniform contour-point density,
+    which is essential for rotationally-invariant radial_std and
+    ray-based distance calculations.
+    """
     contours, hierarchy = cv2.findContours(
-        mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
     if not contours or hierarchy is None:
         return None, None
 
@@ -129,48 +134,96 @@ def find_contours(mask: np.ndarray):
     return outer, inner
 
 
+def fit_circle_lsq(contour):
+    """Least-squares circle fit (Kåsa method).
+
+    Returns (cx, cy, radius).  All contour points contribute equally,
+    making the result robust to rotation in discrete pixel space.
+    """
+    pts = contour.reshape(-1, 2).astype(np.float64)
+    x, y = pts[:, 0], pts[:, 1]
+    A = np.column_stack([2 * x, 2 * y, np.ones(len(x))])
+    b = x ** 2 + y ** 2
+    res, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    cx, cy, c = res
+    radius = math.sqrt(max(c + cx ** 2 + cy ** 2, 0.0))
+    return float(cx), float(cy), float(radius)
+
+
 def radial_std(contour: np.ndarray) -> float:
     """Standard deviation of distances from centroid to contour points.
 
     Lower = more circular. A perfect circle has radial_std ≈ 0.
+    Uses moments-based centroid for rotation invariance.
     """
     pts = contour.reshape(-1, 2).astype(float)
-    cx, cy = pts.mean(axis=0)
+    M = cv2.moments(contour)
+    if M["m00"] == 0:
+        cx, cy = pts.mean(axis=0)
+    else:
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
     dists = np.sqrt((pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2)
     return float(np.std(dists))
 
 
-def sample_wall_thickness(outer, inner, n_samples: int = THICKNESS_SAMPLES) -> np.ndarray:
+def sample_wall_thickness(outer, inner, n_samples: int = THICKNESS_SAMPLES,
+                          mask: np.ndarray = None,
+                          center: tuple = None) -> np.ndarray:
     """Sample wall thickness at n_samples evenly-spaced angles.
 
-    For each angle, cast a ray from the centroid of the ring outward:
-    - Find where the ray intersects the outer contour → outer_r
-    - Find where the ray intersects the inner contour → inner_r
-    - Wall thickness at that angle = outer_r − inner_r
-
-    Falls back to point-polygon-test method if ray casting is tricky.
+    When *mask* is supplied, uses mask-based ray tracing (walk along a
+    ray on the binary mask to find inner/outer edges).  This is
+    independent of contour-point density and therefore rotation-invariant.
     """
-    # Use centroid of outer contour as center
-    M = cv2.moments(outer)
-    if M["m00"] == 0:
-        return np.array([])
-    cx = M["m10"] / M["m00"]
-    cy = M["m01"] / M["m00"]
+    # Determine centre
+    if center is not None:
+        cx, cy = center
+    else:
+        M = cv2.moments(outer)
+        if M["m00"] == 0:
+            return np.array([])
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
 
+    # Mask-based ray tracing (preferred)
+    if mask is not None:
+        h, w = mask.shape[:2]
+        max_r = int(math.hypot(w, h))
+        thicknesses = []
+        for i in range(n_samples):
+            angle = 2.0 * math.pi * i / n_samples
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+            inner_r = None
+            outer_r = None
+            for r in range(1, max_r):
+                px = int(round(cx + r * cos_a))
+                py = int(round(cy + r * sin_a))
+                if not (0 <= px < w and 0 <= py < h):
+                    break
+                val = mask[py, px]
+                if inner_r is None:
+                    if val > 0:
+                        inner_r = r
+                else:
+                    if val == 0:
+                        outer_r = r
+                        break
+            if inner_r is not None and outer_r is not None:
+                thicknesses.append(float(outer_r - inner_r))
+        return np.array(thicknesses)
+
+    # Fallback: contour-point ray casting
     thicknesses = []
     for i in range(n_samples):
         angle = 2.0 * math.pi * i / n_samples
-        # Point far away along the ray
         far_x = cx + 2000 * math.cos(angle)
         far_y = cy + 2000 * math.sin(angle)
-
-        # Distance from center to outer contour along this direction
         d_outer = _ray_contour_distance(cx, cy, far_x, far_y, outer)
         d_inner = _ray_contour_distance(cx, cy, far_x, far_y, inner)
-
         if d_outer is not None and d_inner is not None and d_outer > d_inner:
             thicknesses.append(d_outer - d_inner)
-
     return np.array(thicknesses)
 
 
@@ -228,7 +281,11 @@ def edge_clearance(outer, inner, img_shape) -> float:
 
 
 def measure_oring(image: np.ndarray, filename: str) -> Optional[Dict]:
-    """Run full measurement pipeline on a BGR image."""
+    """Run full measurement pipeline on a BGR image.
+
+    Uses least-squares circle fitting and mask-based ray tracing
+    for rotationally-invariant measurements.
+    """
     mask = build_mask(image)
     outer, inner = find_contours(mask)
 
@@ -238,20 +295,20 @@ def measure_oring(image: np.ndarray, filename: str) -> Optional[Dict]:
 
     h, w = image.shape[:2]
 
-    # Fitted circles
-    (ox, oy), orad = cv2.minEnclosingCircle(outer)
-    (ix, iy), irad = cv2.minEnclosingCircle(inner)
+    # Least-squares circle fit (rotation-invariant)
+    ox, oy, orad = fit_circle_lsq(outer)
+    ix, iy, irad = fit_circle_lsq(inner)
     cdist = math.hypot(ox - ix, oy - iy)
     rthick = float(orad) - float(irad)
     mrad = (float(orad) + float(irad)) / 2.0
 
-    # Wall thickness sampling
-    thicknesses = sample_wall_thickness(outer, inner, THICKNESS_SAMPLES)
+    # Wall thickness sampling via mask-based ray tracing
+    thicknesses = sample_wall_thickness(
+        outer, inner, THICKNESS_SAMPLES, mask=mask, center=(ox, oy))
     if len(thicknesses) < 10:
-        # Fallback: use point-polygon-test based method
         min_t, max_t = _contour_distances_fallback(outer, inner)
         mean_t = (min_t + max_t) / 2.0
-        std_t = (max_t - min_t) / 4.0  # rough estimate
+        std_t = (max_t - min_t) / 4.0
     else:
         min_t = float(np.min(thicknesses))
         max_t = float(np.max(thicknesses))

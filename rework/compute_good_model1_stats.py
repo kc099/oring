@@ -74,7 +74,8 @@ def build_mask(image: np.ndarray) -> np.ndarray:
 
 
 def find_contours(mask):
-    contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    """Uses CHAIN_APPROX_NONE for uniform contour-point density."""
+    contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
     if not contours or hierarchy is None:
         return None, None
     areas = [cv2.contourArea(c) for c in contours]
@@ -88,9 +89,27 @@ def find_contours(mask):
     return outer, inner
 
 
+def fit_circle_lsq(contour):
+    """Least-squares circle fit (Kåsa method).  Returns (cx, cy, radius)."""
+    pts = contour.reshape(-1, 2).astype(np.float64)
+    x, y = pts[:, 0], pts[:, 1]
+    A = np.column_stack([2 * x, 2 * y, np.ones(len(x))])
+    b = x ** 2 + y ** 2
+    res, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    cx, cy, c = res
+    radius = math.sqrt(max(c + cx ** 2 + cy ** 2, 0.0))
+    return float(cx), float(cy), float(radius)
+
+
 def radial_std(contour):
+    """Std dev of distances from moments-based centroid to contour points."""
     pts = contour.reshape(-1, 2).astype(float)
-    cx, cy = pts.mean(axis=0)
+    M = cv2.moments(contour)
+    if M["m00"] == 0:
+        cx, cy = pts.mean(axis=0)
+    else:
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
     dists = np.sqrt((pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2)
     return float(np.std(dists))
 
@@ -115,12 +134,45 @@ def _ray_contour_distance(cx, cy, fx, fy, contour):
     return float(np.median(dists[mask]))
 
 
-def sample_wall_thickness(outer, inner, n_samples=THICKNESS_SAMPLES):
-    M = cv2.moments(outer)
-    if M["m00"] == 0:
-        return np.array([])
-    cx = M["m10"] / M["m00"]
-    cy = M["m01"] / M["m00"]
+def sample_wall_thickness(outer, inner, n_samples=THICKNESS_SAMPLES,
+                          mask=None, center=None):
+    """Mask-based ray tracing for rotation-invariant wall thickness."""
+    if center is not None:
+        cx, cy = center
+    else:
+        M = cv2.moments(outer)
+        if M["m00"] == 0:
+            return np.array([])
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+
+    if mask is not None:
+        h, w = mask.shape[:2]
+        max_r = int(math.hypot(w, h))
+        thicknesses = []
+        for i in range(n_samples):
+            angle = 2.0 * math.pi * i / n_samples
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+            inner_r = None
+            outer_r = None
+            for r in range(1, max_r):
+                px = int(round(cx + r * cos_a))
+                py = int(round(cy + r * sin_a))
+                if not (0 <= px < w and 0 <= py < h):
+                    break
+                val = mask[py, px]
+                if inner_r is None:
+                    if val > 0:
+                        inner_r = r
+                else:
+                    if val == 0:
+                        outer_r = r
+                        break
+            if inner_r is not None and outer_r is not None:
+                thicknesses.append(float(outer_r - inner_r))
+        return np.array(thicknesses)
+
     thicknesses = []
     for i in range(n_samples):
         angle = 2.0 * math.pi * i / n_samples
@@ -166,13 +218,14 @@ def measure_oring(image, filename):
         return None
 
     h, w = image.shape[:2]
-    (ox, oy), orad = cv2.minEnclosingCircle(outer)
-    (ix, iy), irad = cv2.minEnclosingCircle(inner)
+    ox, oy, orad = fit_circle_lsq(outer)
+    ix, iy, irad = fit_circle_lsq(inner)
     cdist = math.hypot(ox - ix, oy - iy)
     rthick = float(orad) - float(irad)
     mrad = (float(orad) + float(irad)) / 2.0
 
-    thicknesses = sample_wall_thickness(outer, inner, THICKNESS_SAMPLES)
+    thicknesses = sample_wall_thickness(
+        outer, inner, THICKNESS_SAMPLES, mask=mask, center=(ox, oy))
     if len(thicknesses) < 10:
         min_t, max_t = _contour_distances_fallback(outer, inner)
         mean_t = (min_t + max_t) / 2.0

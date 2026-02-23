@@ -69,9 +69,10 @@ MASKRCNN_CHECKPOINT = (
 )
 
 # ── YOLO v11 segmentation checkpoint ─────────────────────────────────────
-YOLO_CHECKPOINT = (
-    WORKSPACE / "yolo_training" / "runs" / "yolo11n-seg_training2" / "weights" / "best.pt"
-)
+# Try yolo26n-seg first, fall back to yolo11n-seg
+_YOLO_26_CKPT = WORKSPACE / "yolo_training" / "runs" / "yolo26n-seg_training" / "weights" / "best.pt"
+_YOLO_11_CKPT = WORKSPACE / "yolo_training" / "runs" / "yolo11n-seg_training2" / "weights" / "best.pt"
+YOLO_CHECKPOINT = _YOLO_26_CKPT if _YOLO_26_CKPT.exists() else _YOLO_11_CKPT
 
 # Defect detection model options
 DEFECT_MODEL_OPTIONS = ["Mask R-CNN", "YOLO v11"]
@@ -351,9 +352,16 @@ def build_mask(image: np.ndarray, bg_value: int = 20, threshold: int = 30) -> np
 
 
 def find_contours(mask: np.ndarray):
-    """Return (outer, inner) contours of the ring, or (None, None)."""
+    """Return (outer, inner) contours of the ring, or (None, None).
+
+    Uses CHAIN_APPROX_NONE to keep every boundary pixel so that
+    contour-point-based metrics (radial_std, ray distances) are
+    rotationally invariant — CHAIN_APPROX_SIMPLE compresses
+    horizontal / vertical / diagonal runs to their endpoints,
+    producing a point density that changes with orientation.
+    """
     contours, hierarchy = cv2.findContours(
-        mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
     if not contours or hierarchy is None:
         return None, None
 
@@ -369,10 +377,41 @@ def find_contours(mask: np.ndarray):
     return outer, inner
 
 
+def fit_circle_lsq(contour: np.ndarray):
+    """Least-squares circle fit (Kåsa method).
+
+    All contour points contribute equally, making the result much
+    more rotationally stable than ``cv2.minEnclosingCircle`` (which
+    depends on only 2–3 extreme hull points that shift with pixel
+    discretisation when the part is rotated).
+
+    Returns (cx, cy, radius).
+    """
+    pts = contour.reshape(-1, 2).astype(np.float64)
+    x, y = pts[:, 0], pts[:, 1]
+    # Solve  2·a·x + 2·b·y + c = x² + y²  in the least-squares sense
+    A = np.column_stack([2 * x, 2 * y, np.ones(len(x))])
+    b = x ** 2 + y ** 2
+    res, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    cx, cy, c = res
+    radius = math.sqrt(max(c + cx ** 2 + cy ** 2, 0.0))
+    return float(cx), float(cy), float(radius)
+
+
 def radial_std(contour: np.ndarray) -> float:
-    """Std dev of distances from centroid to contour points.  0 = perfect circle."""
+    """Std dev of distances from centroid to contour points.  0 = perfect circle.
+
+    Uses the area-weighted centroid (``cv2.moments``) instead of the
+    plain point-mean so the result does not depend on how contour
+    points are distributed — only on the enclosed shape.
+    """
     pts = contour.reshape(-1, 2).astype(float)
-    cx, cy = pts.mean(axis=0)
+    M = cv2.moments(contour)
+    if M["m00"] == 0:
+        cx, cy = pts.mean(axis=0)        # fallback
+    else:
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
     dists = np.sqrt((pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2)
     return float(np.std(dists))
 
@@ -396,13 +435,62 @@ def _ray_contour_distance(cx, cy, fx, fy, contour):
     return float(np.median(dists[mask]))
 
 
-def sample_wall_thickness(outer, inner, n_samples: int = 360):
-    """Sample wall thickness at evenly-spaced angles around the ring."""
-    M = cv2.moments(outer)
-    if M["m00"] == 0:
-        return np.array([])
-    cx = M["m10"] / M["m00"]
-    cy = M["m01"] / M["m00"]
+def sample_wall_thickness(outer, inner, n_samples: int = 360,
+                          mask: np.ndarray = None,
+                          center: tuple = None):
+    """Sample wall thickness at evenly-spaced angles around the ring.
+
+    Parameters
+    ----------
+    outer, inner : contours (used only as fallback when *mask* is None)
+    n_samples    : number of angular samples
+    mask         : binary mask of the ring (preferred — rotation-invariant)
+    center       : (cx, cy) ray origin; defaults to outer moments centroid
+
+    When *mask* is supplied the thickness at each angle is measured by
+    walking along a ray on the mask and detecting the 0→255 (inner edge)
+    and 255→0 (outer edge) transitions.  This is independent of contour
+    point density and therefore fully rotation-invariant.
+    """
+    # Determine centre
+    if center is not None:
+        cx, cy = center
+    else:
+        M = cv2.moments(outer)
+        if M["m00"] == 0:
+            return np.array([])
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+
+    # ── Mask-based ray tracing (preferred) ────────────────────────────
+    if mask is not None:
+        h, w = mask.shape[:2]
+        max_r = int(math.hypot(w, h))
+        thicknesses = []
+        for i in range(n_samples):
+            angle = 2.0 * math.pi * i / n_samples
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+            inner_r = None
+            outer_r = None
+            for r in range(1, max_r):
+                px = int(round(cx + r * cos_a))
+                py = int(round(cy + r * sin_a))
+                if not (0 <= px < w and 0 <= py < h):
+                    break
+                val = mask[py, px]
+                if inner_r is None:
+                    if val > 0:
+                        inner_r = r
+                else:
+                    if val == 0:
+                        outer_r = r
+                        break
+            if inner_r is not None and outer_r is not None:
+                thicknesses.append(float(outer_r - inner_r))
+        return np.array(thicknesses)
+
+    # ── Fallback: contour-point ray casting ───────────────────────────
     thicknesses = []
     for i in range(n_samples):
         angle = 2.0 * math.pi * i / n_samples
@@ -461,7 +549,17 @@ def auto_bg_value(image: np.ndarray, margin: int = 80) -> int:
 def measure_oring(image: np.ndarray,
                   bg_value: int = 20,
                   threshold: int = 30) -> Optional[Dict]:
-    """Run full measurement pipeline on a BGR image."""
+    """Run full measurement pipeline on a BGR image.
+
+    Uses least-squares circle fitting (Kåsa method) instead of
+    ``cv2.minEnclosingCircle`` so that radius / centre estimates
+    are driven by *all* contour points rather than 2–3 extremes,
+    making them robust to rotation in discrete pixel space.
+
+    Wall thickness is sampled via mask-based ray tracing from the
+    fitted outer-circle centre, eliminating any dependency on
+    contour-point density.
+    """
     mask = build_mask(image, bg_value, threshold)
     outer, inner = find_contours(mask)
     if outer is None or inner is None:
@@ -469,15 +567,17 @@ def measure_oring(image: np.ndarray,
 
     h, w = image.shape[:2]
 
-    (ox, oy), orad = cv2.minEnclosingCircle(outer)
-    (ix, iy), irad = cv2.minEnclosingCircle(inner)
+    # Least-squares circle fit (rotation-invariant)
+    ox, oy, orad = fit_circle_lsq(outer)
+    ix, iy, irad = fit_circle_lsq(inner)
     cdx, cdy = float(ox - ix), float(oy - iy)
     cdist = math.hypot(cdx, cdy)
     rthick = float(orad) - float(irad)
     mrad = (float(orad) + float(irad)) / 2.0
 
-    # Wall thickness via ray sampling
-    thicknesses = sample_wall_thickness(outer, inner, 360)
+    # Wall thickness via mask-based ray sampling from fitted outer centre
+    thicknesses = sample_wall_thickness(
+        outer, inner, 360, mask=mask, center=(ox, oy))
     if len(thicknesses) < 10:
         min_t, max_t = contour_distances(outer, inner)
         mean_t = (min_t + max_t) / 2.0

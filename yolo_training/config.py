@@ -5,8 +5,9 @@ Easily modify these settings to experiment with different configurations.
 
 # Model Configuration
 MODEL_CONFIG = {
-    # Model size options: yolov8n-seg, yolov8s-seg, yolov8m-seg, yolov8l-seg, yolov8x-seg
-    'model_name': 'yolov8m-seg',
+    # Primary: yolo26n-seg (Jan 2026), fallback: yolo11n-seg
+    'model_name': 'yolo26n-seg',
+    'fallback_model_name': 'yolo11n-seg',
     'pretrained': True,
     'freeze_backbone': False,  # Freeze backbone layers
 }
@@ -26,10 +27,10 @@ AUGMENTATION_CONFIG = {
     'hsv_h': 0.015,      # Image HSV-Hue augmentation
     'hsv_s': 0.7,        # Image HSV-Saturation augmentation
     'hsv_v': 0.4,        # Image HSV-Value augmentation
-    'degrees': 10.0,     # Image rotation (+/- deg)
+    'degrees': 180.0,    # Image rotation (+/- deg) — full range for rotation invariance
     'translate': 0.1,    # Image translation (+/- fraction)
     'scale': 0.5,        # Image scale (+/- gain)
-    'flipud': 0.0,       # Image flip up-down (probability)
+    'flipud': 0.5,       # Image flip up-down (probability)
     'fliplr': 0.5,       # Image flip left-right (probability)
     'mosaic': 1.0,       # Image mosaic (probability)
     'mixup': 0.0,        # Image mixup (probability)
