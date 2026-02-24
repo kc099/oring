@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QMessageBox,
     QGroupBox, QDoubleSpinBox, QSpinBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QFrame, QComboBox,
+    QHeaderView, QFrame, QComboBox, QCheckBox,
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
@@ -70,8 +70,8 @@ MASKRCNN_CHECKPOINT = (
 
 # ── YOLO v11 segmentation checkpoint ─────────────────────────────────────
 # Try yolo26n-seg first, fall back to yolo11n-seg
-_YOLO_26_CKPT = WORKSPACE / "yolo_training" / "runs" / "yolo26n-seg_training" / "weights" / "best.pt"
-_YOLO_11_CKPT = WORKSPACE / "yolo_training" / "runs" / "yolo11n-seg_training2" / "weights" / "best.pt"
+_YOLO_26_CKPT = WORKSPACE / "yolo_training4" / "runs" / "yolo26n-seg_training" / "weights" / "best.pt"
+_YOLO_11_CKPT = WORKSPACE / "yolo_training" / "runs" / "yolo11n-seg_training" / "weights" / "best.pt"
 YOLO_CHECKPOINT = _YOLO_26_CKPT if _YOLO_26_CKPT.exists() else _YOLO_11_CKPT
 
 # Defect detection model options
@@ -87,21 +87,11 @@ REFERENCE_RESOLUTION = (2448, 2048)   # (width, height) of original camera image
 METRIC_SCALE_TYPE = {
     "outer_radius":      "linear",
     "inner_radius":      "linear",
-    "ring_thickness":    "linear",
-    "mean_thickness":    "linear",
-    "min_thickness":     "linear",
-    "max_thickness":     "linear",
-    "thickness_range":   "linear",
-    "thickness_std":     "linear",
     "center_dist":       "linear",
-    "edge_clearance":    "linear",
     "outer_radial_std":  "linear",
     "inner_radial_std":  "linear",
-    "annular_area_k":    "area",
     "circularity_outer": "none",
     "circularity_inner": "none",
-    "thickness_ratio":   "none",
-    "thickness_cv":      "none",
     "eccentricity_pct":  "none",
 }
 
@@ -173,41 +163,21 @@ METRIC_DEFS = [
     ("outer_radial_std", "Outer Radial Std",      "px",   "max",   1, 1.0,    0, 200,  "rework"),
     ("inner_radial_std", "Inner Radial Std",      "px",   "max",   1, 1.0,    0, 200,  "rework"),
 
-    # ── REJECT metrics (thickness / concentricity / area — unfixable) ────
-    ("ring_thickness",   "Ring Thickness (fitted)","px",  "range", 1, 1.0,  100, 600,  "reject"),
-    ("mean_thickness",   "Mean Wall Thickness",   "px",   "range", 1, 1.0,  100, 600,  "reject"),
-    ("min_thickness",    "Min Wall Thickness",    "px",   "min",   1, 1.0,    0, 500,  "reject"),
-    ("max_thickness",    "Max Wall Thickness",    "px",   "max",   1, 1.0,    0, 600,  "reject"),
-    ("thickness_range",  "Thickness Range",       "px",   "max",   1, 1.0,    0, 500,  "reject"),
-    ("thickness_ratio",  "Thickness Ratio",       "",     "max",   2, 0.01,   1, 3,    "reject"),
-    ("thickness_std",    "Thickness Std Dev",     "px",   "max",   1, 0.5,    0, 100,  "reject"),
-    ("thickness_cv",     "Thickness CV",          "%",    "max",   2, 0.1,    0, 50,   "reject"),
+    # ── REJECT metrics (concentricity only) ──────────────────────────────
     ("center_dist",      "Center Distance",       "px",   "max",   1, 1.0,    0, 500,  "reject"),
     ("eccentricity_pct", "Eccentricity",          "%",    "max",   2, 0.1,    0, 50,   "reject"),
-    ("annular_area_k",   "Annular Area (×1000)",  "",     "range", 1, 5.0,    0, 5000, "reject"),
-    ("edge_clearance",   "Edge Clearance",        "px",   "min",   0, 1.0,    0, 1000, "reject"),
 ]
 
 # Fallback thresholds when CSV is missing
 DEFAULT_THRESHOLDS = {
     "outer_radius":      {"lo": 650.0, "hi": 680.0},
     "inner_radius":      {"lo": 375.0, "hi": 400.0},
-    "ring_thickness":    {"lo": 260.0, "hi": 295.0},
-    "mean_thickness":    {"lo": 260.0, "hi": 295.0},
-    "min_thickness":     {"lo": 230.0, "hi": 9999.0},
-    "max_thickness":     {"lo": 0.0,   "hi": 325.0},
-    "thickness_range":   {"lo": 0.0,   "hi": 60.0},
-    "thickness_ratio":   {"lo": 1.0,   "hi": 1.25},
-    "thickness_std":     {"lo": 0.0,   "hi": 15.0},
-    "thickness_cv":      {"lo": 0.0,   "hi": 5.5},
     "center_dist":       {"lo": 0.0,   "hi": 35.0},
     "eccentricity_pct":  {"lo": 0.0,   "hi": 6.0},
-    "annular_area_k":    {"lo": 780.0, "hi": 950.0},
     "circularity_outer": {"lo": 0.75,  "hi": 1.0},
     "circularity_inner": {"lo": 0.75,  "hi": 1.0},
     "outer_radial_std":  {"lo": 0.0,   "hi": 40.0},
     "inner_radial_std":  {"lo": 0.0,   "hi": 30.0},
-    "edge_clearance":    {"lo": 5.0,   "hi": 9999.0},
 }
 
 
@@ -709,6 +679,7 @@ class InspectionGUI(QMainWindow):
 
         self.lo_spins: Dict[str, QDoubleSpinBox] = {}
         self.hi_spins: Dict[str, QDoubleSpinBox] = {}
+        self.metric_checks: Dict[str, QCheckBox] = {}  # per-metric enable checkboxes
 
         self._init_ui()
         self._populate_table()
@@ -917,16 +888,61 @@ class InspectionGUI(QMainWindow):
         tg.setLayout(tl)
         right_lay.addWidget(tg)
 
+        # --- Metric selection controls ------------------------------------
+        sel_group = QGroupBox("Active Metrics")
+        sel_lay = QHBoxLayout()
+
+        rework_sel_lay = QVBoxLayout()
+        rework_sel_label = QLabel("Rework")
+        rework_sel_label.setStyleSheet("color:#FF9800; font-weight:bold; font-size:11px;")
+        rework_sel_lay.addWidget(rework_sel_label)
+        rework_btn_row = QHBoxLayout()
+        self.rework_all_btn = QPushButton("All")
+        self.rework_all_btn.setFixedWidth(50)
+        self.rework_all_btn.clicked.connect(lambda: self._set_category_checks("rework", True))
+        rework_btn_row.addWidget(self.rework_all_btn)
+        self.rework_none_btn = QPushButton("None")
+        self.rework_none_btn.setFixedWidth(50)
+        self.rework_none_btn.clicked.connect(lambda: self._set_category_checks("rework", False))
+        rework_btn_row.addWidget(self.rework_none_btn)
+        rework_btn_row.addStretch()
+        rework_sel_lay.addLayout(rework_btn_row)
+        sel_lay.addLayout(rework_sel_lay)
+
+        sel_lay.addSpacing(16)
+
+        reject_sel_lay = QVBoxLayout()
+        reject_sel_label = QLabel("Reject")
+        reject_sel_label.setStyleSheet("color:#B71C1C; font-weight:bold; font-size:11px;")
+        reject_sel_lay.addWidget(reject_sel_label)
+        reject_btn_row = QHBoxLayout()
+        self.reject_all_btn = QPushButton("All")
+        self.reject_all_btn.setFixedWidth(50)
+        self.reject_all_btn.clicked.connect(lambda: self._set_category_checks("reject", True))
+        reject_btn_row.addWidget(self.reject_all_btn)
+        self.reject_none_btn = QPushButton("None")
+        self.reject_none_btn.setFixedWidth(50)
+        self.reject_none_btn.clicked.connect(lambda: self._set_category_checks("reject", False))
+        reject_btn_row.addWidget(self.reject_none_btn)
+        reject_btn_row.addStretch()
+        reject_sel_lay.addLayout(reject_btn_row)
+        sel_lay.addLayout(reject_sel_lay)
+
+        sel_lay.addStretch()
+        sel_group.setLayout(sel_lay)
+        right_lay.addWidget(sel_group)
+
         # --- Metrics table ------------------------------------------------
         mg = QGroupBox("Measurements && Thresholds  (editable)")
         ml = QVBoxLayout()
         self.table = QTableWidget()
-        self.table.setColumnCount(6)
+        self.table.setColumnCount(7)
         self.table.setHorizontalHeaderLabels(
-            ["Metric", "Measured", "Min", "Max", "Status", "Category"])
+            ["On", "Metric", "Measured", "Min", "Max", "Status", "Category"])
         hdr = self.table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
-        for c in (1, 2, 3, 4, 5):
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        for c in (2, 3, 4, 5, 6):
             hdr.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
         self.table.setRowCount(len(METRIC_DEFS))
@@ -945,27 +961,41 @@ class InspectionGUI(QMainWindow):
         root.addWidget(right, stretch=2)
 
     def _populate_table(self):
-        """Fill table rows with metric labels, threshold spinboxes."""
+        """Fill table rows with metric labels, threshold spinboxes, and enable checkboxes."""
         for row, (key, name, unit, ttype, dec, step, s_lo, s_hi, category) in \
                 enumerate(METRIC_DEFS):
             label = f"{name}" + (f"  ({unit})" if unit else "")
 
-            # Col 0  – metric name
-            item0 = QTableWidgetItem(label)
-            item0.setFlags(item0.flags() & ~Qt.ItemIsEditable)
+            # Col 0  – enable checkbox
+            chk = QCheckBox()
+            chk.setChecked(True)
+            chk.setToolTip(f"Include '{name}' in verdict evaluation")
+            chk.stateChanged.connect(self._on_metric_check_changed)
+            # Wrap in a centered widget
+            chk_widget = QWidget()
+            chk_lay = QHBoxLayout(chk_widget)
+            chk_lay.addWidget(chk)
+            chk_lay.setAlignment(Qt.AlignCenter)
+            chk_lay.setContentsMargins(0, 0, 0, 0)
+            self.table.setCellWidget(row, 0, chk_widget)
+            self.metric_checks[key] = chk
+
+            # Col 1  – metric name
+            item1 = QTableWidgetItem(label)
+            item1.setFlags(item1.flags() & ~Qt.ItemIsEditable)
             if self.good_stats and key in self.good_stats:
                 gs = self.good_stats[key]
-                item0.setToolTip(
+                item1.setToolTip(
                     f"Good samples: {gs['mean']:.2f} ± {gs['std']:.2f}")
-            self.table.setItem(row, 0, item0)
-
-            # Col 1  – measured value (placeholder)
-            item1 = QTableWidgetItem("—")
-            item1.setFlags(item1.flags() & ~Qt.ItemIsEditable)
-            item1.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, 1, item1)
 
-            # Col 2  – lo threshold spinbox
+            # Col 2  – measured value (placeholder)
+            item2 = QTableWidgetItem("—")
+            item2.setFlags(item2.flags() & ~Qt.ItemIsEditable)
+            item2.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 2, item2)
+
+            # Col 3  – lo threshold spinbox
             lo_spin = QDoubleSpinBox()
             lo_spin.setDecimals(dec)
             lo_spin.setSingleStep(step)
@@ -976,10 +1006,10 @@ class InspectionGUI(QMainWindow):
             if ttype == "max":
                 lo_spin.setEnabled(False)
                 lo_spin.setStyleSheet("color:#666; background:#3a3a3a;")
-            self.table.setCellWidget(row, 2, lo_spin)
+            self.table.setCellWidget(row, 3, lo_spin)
             self.lo_spins[key] = lo_spin
 
-            # Col 3  – hi threshold spinbox
+            # Col 4  – hi threshold spinbox
             hi_spin = QDoubleSpinBox()
             hi_spin.setDecimals(dec)
             hi_spin.setSingleStep(step)
@@ -990,23 +1020,23 @@ class InspectionGUI(QMainWindow):
             if ttype == "min":
                 hi_spin.setEnabled(False)
                 hi_spin.setStyleSheet("color:#666; background:#3a3a3a;")
-            self.table.setCellWidget(row, 3, hi_spin)
+            self.table.setCellWidget(row, 4, hi_spin)
             self.hi_spins[key] = hi_spin
 
-            # Col 4  – status
-            item4 = QTableWidgetItem("—")
-            item4.setFlags(item4.flags() & ~Qt.ItemIsEditable)
-            item4.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 4, item4)
-
-            # Col 5  – category (REWORK / REJECT)
-            cat_label = "REWORK" if category == "rework" else "REJECT"
-            cat_color = QColor(255, 152, 0) if category == "rework" else QColor(183, 28, 28)
-            item5 = QTableWidgetItem(cat_label)
+            # Col 5  – status
+            item5 = QTableWidgetItem("—")
             item5.setFlags(item5.flags() & ~Qt.ItemIsEditable)
             item5.setTextAlignment(Qt.AlignCenter)
-            item5.setForeground(cat_color)
             self.table.setItem(row, 5, item5)
+
+            # Col 6  – category (REWORK / REJECT)
+            cat_label = "REWORK" if category == "rework" else "REJECT"
+            cat_color = QColor(255, 152, 0) if category == "rework" else QColor(183, 28, 28)
+            item6 = QTableWidgetItem(cat_label)
+            item6.setFlags(item6.flags() & ~Qt.ItemIsEditable)
+            item6.setTextAlignment(Qt.AlignCenter)
+            item6.setForeground(cat_color)
+            self.table.setItem(row, 6, item6)
 
     # ── Threshold helpers ────────────────────────────────────────────────
 
@@ -1038,6 +1068,24 @@ class InspectionGUI(QMainWindow):
         """Called when user changes defect model dropdown."""
         self._defect_model = model_name
         print(f"Defect model changed to: {model_name}")
+
+    # ── Metric checkbox helpers ──────────────────────────────────────────
+
+    def _on_metric_check_changed(self, _state=None):
+        """Re-evaluate verdict when a metric checkbox is toggled."""
+        if self.result is not None:
+            self._evaluate()
+
+    def _set_category_checks(self, category: str, checked: bool):
+        """Set all checkboxes in a category to checked/unchecked."""
+        for key, _name, _unit, _ttype, *_, cat in METRIC_DEFS:
+            if cat == category and key in self.metric_checks:
+                self.metric_checks[key].blockSignals(True)
+                self.metric_checks[key].setChecked(checked)
+                self.metric_checks[key].blockSignals(False)
+        # Re-evaluate once after batch update
+        if self.result is not None:
+            self._evaluate()
 
     # ── YOLO v11 helpers ─────────────────────────────────────────────────
 
@@ -1423,10 +1471,22 @@ class InspectionGUI(QMainWindow):
             lo = self.thresholds[key]["lo"]
             hi = self.thresholds[key]["hi"]
 
+            # Check if this metric is enabled via checkbox
+            metric_enabled = self.metric_checks.get(key) is not None and \
+                             self.metric_checks[key].isChecked()
+
             # Update measured value
             fmt = f"{{:.{dec}f}}"
-            val_item = self.table.item(row, 1)
+            val_item = self.table.item(row, 2)
             val_item.setText(fmt.format(val))
+
+            # If metric is disabled, show value but mark as skipped
+            status_item = self.table.item(row, 5)
+            if not metric_enabled:
+                status_item.setText("⏭ SKIP")
+                status_item.setForeground(QColor(120, 120, 120))
+                val_item.setForeground(QColor(120, 120, 120))
+                continue
 
             # Check pass / fail
             passed = True
@@ -1444,7 +1504,6 @@ class InspectionGUI(QMainWindow):
                 if ttype in ("range", "max") and val > hi:
                     passed = False
 
-            status_item = self.table.item(row, 4)
             if passed:
                 status_item.setText("✅ PASS")
                 status_item.setForeground(QColor(76, 175, 80))
@@ -1529,10 +1588,10 @@ class InspectionGUI(QMainWindow):
 
     def _clear_results(self):
         for row in range(self.table.rowCount()):
-            self.table.item(row, 1).setText("—")
-            self.table.item(row, 1).setForeground(QColor(170, 170, 170))
-            self.table.item(row, 4).setText("—")
-            self.table.item(row, 4).setForeground(QColor(170, 170, 170))
+            self.table.item(row, 2).setText("—")
+            self.table.item(row, 2).setForeground(QColor(170, 170, 170))
+            self.table.item(row, 5).setText("—")
+            self.table.item(row, 5).setForeground(QColor(170, 170, 170))
         self.verdict_label.setText("AWAITING")
         self.verdict_label.setStyleSheet("color:#ccc;")
         self.verdict_frame.setStyleSheet(

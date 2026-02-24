@@ -5,9 +5,8 @@ Easily modify these settings to experiment with different configurations.
 
 # Model Configuration
 MODEL_CONFIG = {
-    # Primary: yolo26n-seg (Jan 2026), fallback: yolo11n-seg
-    'model_name': 'yolo26n-seg',
-    'fallback_model_name': 'yolo11n-seg',
+    # Options: 'yolo11n-seg' (nano, fast), 'yolo11m-seg' (medium, more accurate)
+    'model_name': 'yolo11n-seg',
     'pretrained': True,
     'freeze_backbone': False,  # Freeze backbone layers
 }
@@ -33,7 +32,7 @@ AUGMENTATION_CONFIG = {
     'flipud': 0.5,       # Image flip up-down (probability)
     'fliplr': 0.5,       # Image flip left-right (probability)
     'mosaic': 1.0,       # Image mosaic (probability)
-    'mixup': 0.0,        # Image mixup (probability)
+    'mixup': 0.1,        # Image mixup (probability)
     'copy_paste': 0.0,   # Segment copy-paste (probability)
 }
 

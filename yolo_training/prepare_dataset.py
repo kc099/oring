@@ -1,7 +1,7 @@
 """
 Script to prepare the YOLO dataset with train/val/test split.
 Creates a data.yaml file required by YOLO for training.
-Ensures stratified splits with both defect and good samples.
+Balances classes (good vs defect) before splitting to avoid bias.
 """
 
 import os
@@ -18,11 +18,16 @@ def create_train_val_test_split(
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
-    random_seed: int = 42
+    random_seed: int = 42,
+    balance: bool = True,
 ) -> dict:
     """
     Split dataset into train, val, and test sets (stratified by defect/good).
-    
+
+    When *balance=True* (default), the good class is downsampled to match the
+    defect count so every split has a ~50/50 ratio.  The same 80/10/10 ratio
+    is applied independently to each class.
+
     Args:
         images_dir: Path to images directory
         labels_dir: Path to labels directory
@@ -31,14 +36,15 @@ def create_train_val_test_split(
         val_ratio: Ratio for validation set (default 0.1)
         test_ratio: Ratio for test set (default 0.1)
         random_seed: Random seed for reproducibility
-    
+        balance: Downsample the majority class to match the minority class
+
     Returns:
         Dictionary with split statistics
     """
     # Verify ratios sum to 1.0
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, \
         f"Ratios must sum to 1.0, got {train_ratio + val_ratio + test_ratio}"
-    
+
     random.seed(random_seed)
 
     def is_defect(label_path: str) -> bool:
@@ -91,44 +97,71 @@ def create_train_val_test_split(
         else:
             good_files.append(file)
 
+    print(f"  Source: {len(defect_files)} defect, {len(good_files)} good")
+
+    # ── Balance classes (downsample majority) ─────────────────────────────
+    if balance:
+        minority = min(len(defect_files), len(good_files))
+        if len(good_files) > minority:
+            random.shuffle(good_files)
+            good_files = good_files[:minority]
+            print(f"  Balanced: downsampled good to {minority} to match defect count")
+        elif len(defect_files) > minority:
+            random.shuffle(defect_files)
+            defect_files = defect_files[:minority]
+            print(f"  Balanced: downsampled defect to {minority} to match good count")
+        else:
+            print(f"  Already balanced at {minority} per class")
+
     d_train, d_val, d_test = split_class(defect_files)
     g_train, g_val, g_test = split_class(good_files)
 
     splits = {
         'train': d_train + g_train,
         'val': d_val + g_val,
-        'test': d_test + g_test
+        'test': d_test + g_test,
     }
-    
+
+    # Clean output directory before copying
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+
     stats = {}
-    
+    detail_stats = {}
+
     for split_name, files in splits.items():
         split_images_dir = os.path.join(output_dir, 'images', split_name)
         split_labels_dir = os.path.join(output_dir, 'labels', split_name)
-        
+
         os.makedirs(split_images_dir, exist_ok=True)
         os.makedirs(split_labels_dir, exist_ok=True)
-        
-        # Copy files
+
+        n_defect = 0
+        n_good = 0
+
         for file in files:
             image_path = os.path.join(images_dir, file)
             label_name = os.path.splitext(file)[0] + '.txt'
             label_path = os.path.join(labels_dir, label_name)
-            
-            # Copy image
+
             shutil.copy2(image_path, os.path.join(split_images_dir, file))
-            
-            # Copy label (even if empty)
+
             if os.path.exists(label_path):
                 shutil.copy2(label_path, os.path.join(split_labels_dir, label_name))
+                if is_defect(label_path):
+                    n_defect += 1
+                else:
+                    n_good += 1
             else:
-                # Create empty label if not found
                 open(os.path.join(split_labels_dir, label_name), 'w').close()
-        
+                n_good += 1
+
         stats[split_name] = len(files)
-        print(f"✓ {split_name.upper():5} : {len(files):4} images")
-    
-    return stats
+        detail_stats[split_name] = {'defect': n_defect, 'good': n_good}
+        print(f"✓ {split_name.upper():5} : {len(files):4} images  "
+              f"(defect={n_defect}, good={n_good})")
+
+    return stats, detail_stats
 
 
 def create_data_yaml(output_dir: str, class_names: list) -> str:
@@ -175,31 +208,32 @@ def main():
     print(f"  Labels: {labels_dir}")
     print(f"\nOutput directory: {output_dir}")
     print("\n" + "=" * 80)
-    print("Creating splits (80% train, 10% val, 10% test)...\n")
-    
-    # Create splits
-    stats = create_train_val_test_split(
+    print("Creating balanced splits (80% train, 10% val, 10% test)...\n")
+
+    # Create splits (balanced: equal defect & good before splitting)
+    stats, detail = create_train_val_test_split(
         images_dir=images_dir,
         labels_dir=labels_dir,
         output_dir=output_dir,
         train_ratio=0.8,
         val_ratio=0.1,
         test_ratio=0.1,
-        random_seed=42
+        random_seed=42,
+        balance=True,
     )
-    
+
     # Create data.yaml
     class_names = ['defect']
     yaml_path = create_data_yaml(output_dir, class_names)
-    
+
     print("\n" + "=" * 80)
     print("Dataset Preparation Complete!")
     print("=" * 80)
-    print(f"\nDataset Statistics:")
-    print(f"  Training set  : {stats['train']} images")
-    print(f"  Validation set: {stats['val']} images")
-    print(f"  Test set      : {stats['test']} images")
-    print(f"  Total         : {sum(stats.values())} images")
+    print(f"\nDataset Statistics (balanced):")
+    for s in ('train', 'val', 'test'):
+        d = detail[s]
+        print(f"  {s:10}: {stats[s]:4} images  (defect={d['defect']}, good={d['good']})")
+    print(f"  {'Total':10}: {sum(stats.values()):4} images")
     print(f"\nClasses: {class_names}")
     print(f"\ndata.yaml created at: {yaml_path}")
     print(f"\nDataset structure:")

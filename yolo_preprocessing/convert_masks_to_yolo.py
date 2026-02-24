@@ -99,6 +99,11 @@ def process_dataset(
         'errors': 0
     }
     
+    # Clean output directory before regenerating
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+        print(f"Cleaned existing output directory: {output_dir}")
+
     # Create output directories
     images_dir = os.path.join(output_dir, 'images')
     labels_dir = os.path.join(output_dir, 'labels')
