@@ -1,51 +1,39 @@
 """
-O-Ring Inspection GUI — Pass / Rework / Reject Classification
+O-Ring Inspection GUI — Pass / Rework / Reject Classification  (Dear PyGui)
 
-Loads a full-resolution (2448×2048) o-ring image, performs background
-subtraction to segment the ring, detects inner/outer contours, computes
-geometric measurements, and compares against statistical thresholds
-derived from known-good samples.
+Single-image display (defect overlay shown only on FAIL).
+Mask R-CNN model pre-loaded at startup with a status indicator.
+Model 1 / Model 2 toggle buttons.
+Hikrobot camera integration (optional).
+Cycle time displayed after each analysis.
 
-Verdict logic (3-way, checked in this order):
-    PASS    — all metrics within tolerance
-    REWORK  — shape issues (circularity, radial_std failures)
-              that are fixable by trimming sharp edges
-    REJECT  — wall thickness / concentricity / area deviations
-              or cut at edges (edge_clearance too low) — unfixable
-
-Thresholds are auto-computed from per-model CSV files.
-Every threshold is editable in the UI; the σ-multiplier controls how
-many standard deviations from the good-sample mean define tolerance.
+Metrics (6 total):
+  REWORK:  outer_radius, inner_radius, circularity_outer/inner
+  REJECT:  center_dist, eccentricity_pct
 
 Usage:
     python rework/inspection_gui.py
-
-Author: GitHub Copilot
-Date: February 16, 2026
 """
 
+from __future__ import annotations
+
+import math
+import os
 import sys
 import csv
 import json
-import math
-import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Dict
 
 import cv2
 import numpy as np
 import torch
+import dearpygui.dearpygui as dpg
 
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFileDialog, QMessageBox,
-    QGroupBox, QDoubleSpinBox, QSpinBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QFrame, QComboBox, QCheckBox,
-)
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QPalette
-
-# ── Hikrobot Camera SDK (optional — only needed for live camera) ─────────
+# ── Hikrobot Camera SDK (optional) ───────────────────────────────────────
 try:
     _MV_DLL_PATH = r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64"
     if os.path.isdir(_MV_DLL_PATH):
@@ -63,79 +51,28 @@ except Exception:
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE  = SCRIPT_DIR.parent
 
-# ── Mask R-CNN checkpoint (binary mode) ──────────────────────────────────
 MASKRCNN_CHECKPOINT = (
     WORKSPACE / "maskrcnn" / "dataset" / "combined" / "checkpoints" / "best_model.pth"
 )
 
-# ── YOLO v11 segmentation checkpoint ─────────────────────────────────────
-# Try yolo26n-seg first, fall back to yolo11n-seg
-_YOLO_26_CKPT = WORKSPACE / "yolo_training4" / "runs" / "yolo26n-seg_training" / "weights" / "best.pt"
-_YOLO_11_CKPT = WORKSPACE / "yolo_training" / "runs" / "yolo11n-seg_training" / "weights" / "best.pt"
-YOLO_CHECKPOINT = _YOLO_26_CKPT if _YOLO_26_CKPT.exists() else _YOLO_11_CKPT
+DEFAULT_BG_VALUE = 20
 
-# Defect detection model options
-DEFECT_MODEL_OPTIONS = ["Mask R-CNN", "YOLO v11"]
+REFERENCE_RESOLUTION = (2448, 2048)
 
-# Reference resolution — thresholds are calibrated at this size
-REFERENCE_RESOLUTION = (2448, 2048)   # (width, height) of original camera images
-
-# How each metric scales with resolution
-#   "linear"  — proportional to pixel size  (divide by scale)
-#   "area"    — proportional to pixel area   (divide by scale²)
-#   "none"    — dimensionless ratio / percentage (no scaling)
 METRIC_SCALE_TYPE = {
     "outer_radius":      "linear",
     "inner_radius":      "linear",
     "center_dist":       "linear",
-    "outer_radial_std":  "linear",
-    "inner_radial_std":  "linear",
     "circularity_outer": "none",
     "circularity_inner": "none",
     "eccentricity_pct":  "none",
 }
 
-
-def compute_resolution_scale(img_w: int, img_h: int) -> float:
-    """Return scale factor relative to REFERENCE_RESOLUTION.
-
-    scale = 1.0 for original resolution, 0.5 for 2×2 binned, etc.
-    Uses the larger dimension to be robust to slight aspect changes.
-    """
-    ref = max(REFERENCE_RESOLUTION)
-    cur = max(img_w, img_h)
-    return cur / ref
-
-
-def normalize_measurements(result: Dict, scale: float) -> Dict:
-    """Scale pixel-based measurements back to reference resolution.
-
-    Divides linear metrics by *scale* and area metrics by *scale²*
-    so that the same thresholds work regardless of input resolution.
-    Dimensionless metrics are left unchanged.
-    Returns a **new** dict (original is not mutated).
-    """
-    if abs(scale - 1.0) < 1e-6:
-        return result          # nothing to do at native resolution
-
-    normed = dict(result)      # shallow copy
-    for key, stype in METRIC_SCALE_TYPE.items():
-        if key not in normed:
-            continue
-        if stype == "linear":
-            normed[key] = normed[key] / scale
-        elif stype == "area":
-            normed[key] = normed[key] / (scale * scale)
-    return normed
-
-
-# Per-model CSV paths (new format with comprehensive metrics)
 MODEL_CSV = {
     "Model 1": SCRIPT_DIR / "model1good_measurements.csv",
     "Model 2": SCRIPT_DIR / "good_measurements.csv",
 }
 
-# Per-model tuned threshold JSON (generated by tune_thresholds.py)
 TUNED_JSON = {
     "Model 1": SCRIPT_DIR / "model1_tuned_thresholds.json",
     "Model 2": SCRIPT_DIR / "model2_tuned_thresholds.json",
@@ -143,32 +80,18 @@ TUNED_JSON = {
 
 DEFAULT_MODEL = "Model 2"
 
-# ── Metric definitions ────────────────────────────────────────────────────
 # (key, display_name, unit, thresh_type, decimals, spin_step, spin_lo, spin_hi, verdict_category)
-#
-#   thresh_type:  'max'   → value must be ≤ hi
-#                 'min'   → value must be ≥ lo
-#                 'range' → lo ≤ value ≤ hi
-#
-#   verdict_category:
-#       "rework"  — failure → REWORK (shape fixable by trimming sharp edges)
-#       "reject"  — failure → REJECT (size / thickness / concentricity — unfixable)
-
 METRIC_DEFS = [
-    # ── REWORK metrics (shape — sharp edges can be trimmed) ───────────────
-    ("outer_radius",     "Outer Radius",          "px",   "range", 1, 1.0,  400, 1200, "rework"),
-    ("inner_radius",     "Inner Radius",          "px",   "range", 1, 1.0,  200, 800,  "rework"),
-    ("circularity_outer","Outer Circularity",     "",     "min",   3, 0.005,  0, 1,    "rework"),
-    ("circularity_inner","Inner Circularity",     "",     "min",   3, 0.005,  0, 1,    "rework"),
-    ("outer_radial_std", "Outer Radial Std",      "px",   "max",   1, 1.0,    0, 200,  "rework"),
-    ("inner_radial_std", "Inner Radial Std",      "px",   "max",   1, 1.0,    0, 200,  "rework"),
-
-    # ── REJECT metrics (concentricity only) ──────────────────────────────
-    ("center_dist",      "Center Distance",       "px",   "max",   1, 1.0,    0, 500,  "reject"),
-    ("eccentricity_pct", "Eccentricity",          "%",    "max",   2, 0.1,    0, 50,   "reject"),
+    ("outer_radius",      "Outer Radius",      "px", "range", 1, 1.0,   400, 1200, "rework"),
+    ("inner_radius",      "Inner Radius",      "px", "range", 1, 1.0,   200, 800,  "rework"),
+    ("circularity_outer", "Outer Circularity",  "",   "min",   3, 0.005,   0, 1,    "rework"),
+    ("circularity_inner", "Inner Circularity",  "",   "min",   3, 0.005,   0, 1,    "rework"),
+    ("center_dist",       "Center Distance",   "px",  "max",   1, 1.0,     0, 500,  "reject"),
+    ("eccentricity_pct",  "Eccentricity",       "%",  "max",   2, 0.1,     0, 50,   "reject"),
 ]
 
-# Fallback thresholds when CSV is missing
+_METRIC_KEYS = {m[0] for m in METRIC_DEFS}
+
 DEFAULT_THRESHOLDS = {
     "outer_radius":      {"lo": 650.0, "hi": 680.0},
     "inner_radius":      {"lo": 375.0, "hi": 400.0},
@@ -176,21 +99,34 @@ DEFAULT_THRESHOLDS = {
     "eccentricity_pct":  {"lo": 0.0,   "hi": 6.0},
     "circularity_outer": {"lo": 0.75,  "hi": 1.0},
     "circularity_inner": {"lo": 0.75,  "hi": 1.0},
-    "outer_radial_std":  {"lo": 0.0,   "hi": 40.0},
-    "inner_radial_std":  {"lo": 0.0,   "hi": 30.0},
 }
+
+IMG_W, IMG_H = 800, 700   # display texture size
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Statistics / threshold helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def load_good_stats(csv_path: Path) -> Optional[Dict]:
-    """Return per-metric {mean, std} from the good-sample measurements CSV.
+def compute_resolution_scale(img_w: int, img_h: int) -> float:
+    ref = max(REFERENCE_RESOLUTION)
+    cur = max(img_w, img_h)
+    return cur / ref
 
-    Supports both old format (with 'method' column) and new format
-    (direct metric columns from compute_good_model*_stats.py).
-    """
+
+def normalize_measurements(result: Dict, scale: float) -> Dict:
+    if abs(scale - 1.0) < 1e-6:
+        return result
+    normed = dict(result)
+    for key, stype in METRIC_SCALE_TYPE.items():
+        if key not in normed:
+            continue
+        if stype == "linear":
+            normed[key] = normed[key] / scale
+    return normed
+
+
+def load_good_stats(csv_path: Path) -> Optional[Dict]:
     if not csv_path.exists():
         return None
     rows = []
@@ -205,50 +141,13 @@ def load_good_stats(csv_path: Path) -> Optional[Dict]:
         return float(np.mean(a)), (float(np.std(a, ddof=1)) if len(a) > 1 else 0.0)
 
     stats: Dict[str, Dict] = {}
-
-    # Direct columns
-    direct_cols = [
-        "outer_radius", "inner_radius", "center_dist",
-        "ring_thickness", "mean_radius",
-        "min_thickness", "max_thickness",
-    ]
-    # New comprehensive columns
-    new_cols = [
-        "mean_thickness", "thickness_std", "thickness_cv",
-        "thickness_range", "thickness_ratio",
-        "circularity_outer", "circularity_inner",
-        "outer_radial_std", "inner_radial_std",
-        "eccentricity_pct", "edge_clearance",
-    ]
-
-    for key in direct_cols + new_cols:
+    for key in _METRIC_KEYS:
         if key in rows[0]:
             vals = [float(r[key]) for r in rows if r.get(key)]
             if vals:
                 m, s = _ms(vals)
                 stats[key] = {"mean": m, "std": s}
 
-    # Derived: thickness_range (if not directly available)
-    if "thickness_range" not in stats and "max_thickness" in rows[0] and "min_thickness" in rows[0]:
-        ranges = [float(r["max_thickness"]) - float(r["min_thickness"]) for r in rows]
-        m, s = _ms(ranges)
-        stats["thickness_range"] = {"mean": m, "std": s}
-
-    # Derived: thickness_ratio (if not directly available)
-    if "thickness_ratio" not in stats and "max_thickness" in rows[0] and "min_thickness" in rows[0]:
-        ratios = [float(r["max_thickness"]) / float(r["min_thickness"])
-                  for r in rows if float(r.get("min_thickness", 0)) > 0]
-        if ratios:
-            m, s = _ms(ratios)
-            stats["thickness_ratio"] = {"mean": m, "std": s}
-
-    # Derived: annular_area_k
-    if "annular_area" in rows[0]:
-        areas_k = [float(r["annular_area"]) / 1000.0 for r in rows]
-        m, s = _ms(areas_k)
-        stats["annular_area_k"] = {"mean": m, "std": s}
-
-    # Derived: eccentricity_pct (if not directly available)
     if "eccentricity_pct" not in stats and "center_dist" in rows[0] and "mean_radius" in rows[0]:
         ecc = [float(r["center_dist"]) / float(r["mean_radius"]) * 100 for r in rows]
         m, s = _ms(ecc)
@@ -258,20 +157,18 @@ def load_good_stats(csv_path: Path) -> Optional[Dict]:
 
 
 def load_tuned_thresholds(json_path: Path) -> Optional[Dict[str, Dict]]:
-    """Load tuned thresholds from JSON (generated by tune_thresholds.py)."""
     if not json_path.exists():
         return None
     with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
-    # JSON has {key: {lo, hi, tolerance_pct}} — keep only lo/hi
     thresholds = {}
     for key in data:
-        thresholds[key] = {"lo": data[key]["lo"], "hi": data[key]["hi"]}
+        if key in _METRIC_KEYS:
+            thresholds[key] = {"lo": data[key]["lo"], "hi": data[key]["hi"]}
     return thresholds
 
 
 def compute_thresholds(stats: Optional[Dict], sigma: float = 2.5) -> Dict[str, Dict]:
-    """Compute {lo, hi} per metric from good-sample stats (fallback)."""
     if stats is None:
         return {k: dict(v) for k, v in DEFAULT_THRESHOLDS.items()}
 
@@ -292,8 +189,38 @@ def compute_thresholds(stats: Optional[Dict], sigma: float = 2.5) -> Dict[str, D
     return thresholds
 
 
+def load_best_thresholds(model_name: str, good_stats, sigma: float) -> Dict[str, Dict]:
+    """Load tuned JSON if available, else sigma-based. Widen REJECT by 10%."""
+    tuned_path = TUNED_JSON.get(model_name)
+    if tuned_path:
+        tuned = load_tuned_thresholds(tuned_path)
+        if tuned:
+            sigma_t = compute_thresholds(good_stats, sigma)
+            for key in sigma_t:
+                if key not in tuned:
+                    tuned[key] = sigma_t[key]
+            thresholds = tuned
+        else:
+            thresholds = compute_thresholds(good_stats, sigma)
+    else:
+        thresholds = compute_thresholds(good_stats, sigma)
+
+    reject_keys = {m[0] for m in METRIC_DEFS if m[8] == "reject"}
+    for key in reject_keys:
+        if key not in thresholds:
+            continue
+        lo = thresholds[key]["lo"]
+        hi = thresholds[key]["hi"]
+        if lo > 0:
+            thresholds[key]["lo"] = round(lo * 0.9, 4)
+        if hi < 9999:
+            thresholds[key]["hi"] = round(hi * 1.1, 4)
+
+    return thresholds
+
+
 # ═══════════════════════════════════════════════════════════════════════════
-#  Image processing
+#  Image processing  (only the 8 metrics)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _largest_component(binary: np.ndarray) -> np.ndarray:
@@ -306,15 +233,13 @@ def _largest_component(binary: np.ndarray) -> np.ndarray:
     return out
 
 
-def build_mask(image: np.ndarray, bg_value: int = 20, threshold: int = 30) -> np.ndarray:
-    """Background subtraction → binary mask of the o-ring."""
+def build_mask(image: np.ndarray, bg_value: int = 20,
+               threshold: int = 30) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     diff = cv2.absdiff(gray, np.full_like(gray, bg_value))
     _, binary = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
-
     if np.mean(binary == 255) > 0.75:
         binary = cv2.bitwise_not(binary)
-
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k, iterations=2)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k, iterations=1)
@@ -322,23 +247,13 @@ def build_mask(image: np.ndarray, bg_value: int = 20, threshold: int = 30) -> np
 
 
 def find_contours(mask: np.ndarray):
-    """Return (outer, inner) contours of the ring, or (None, None).
-
-    Uses CHAIN_APPROX_NONE to keep every boundary pixel so that
-    contour-point-based metrics (radial_std, ray distances) are
-    rotationally invariant — CHAIN_APPROX_SIMPLE compresses
-    horizontal / vertical / diagonal runs to their endpoints,
-    producing a point density that changes with orientation.
-    """
     contours, hierarchy = cv2.findContours(
         mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
     if not contours or hierarchy is None:
         return None, None
-
     areas = [cv2.contourArea(c) for c in contours]
     outer_idx = int(np.argmax(areas))
     outer = contours[outer_idx]
-
     inner = None
     for i, h in enumerate(hierarchy[0]):
         if h[3] == outer_idx:
@@ -348,18 +263,8 @@ def find_contours(mask: np.ndarray):
 
 
 def fit_circle_lsq(contour: np.ndarray):
-    """Least-squares circle fit (Kåsa method).
-
-    All contour points contribute equally, making the result much
-    more rotationally stable than ``cv2.minEnclosingCircle`` (which
-    depends on only 2–3 extreme hull points that shift with pixel
-    discretisation when the part is rotated).
-
-    Returns (cx, cy, radius).
-    """
     pts = contour.reshape(-1, 2).astype(np.float64)
     x, y = pts[:, 0], pts[:, 1]
-    # Solve  2·a·x + 2·b·y + c = x² + y²  in the least-squares sense
     A = np.column_stack([2 * x, 2 * y, np.ones(len(x))])
     b = x ** 2 + y ** 2
     res, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
@@ -368,143 +273,7 @@ def fit_circle_lsq(contour: np.ndarray):
     return float(cx), float(cy), float(radius)
 
 
-def radial_std(contour: np.ndarray) -> float:
-    """Std dev of distances from centroid to contour points.  0 = perfect circle.
-
-    Uses the area-weighted centroid (``cv2.moments``) instead of the
-    plain point-mean so the result does not depend on how contour
-    points are distributed — only on the enclosed shape.
-    """
-    pts = contour.reshape(-1, 2).astype(float)
-    M = cv2.moments(contour)
-    if M["m00"] == 0:
-        cx, cy = pts.mean(axis=0)        # fallback
-    else:
-        cx = M["m10"] / M["m00"]
-        cy = M["m01"] / M["m00"]
-    dists = np.sqrt((pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2)
-    return float(np.std(dists))
-
-
-def _ray_contour_distance(cx, cy, fx, fy, contour):
-    """Distance from (cx,cy) to contour along ray toward (fx,fy)."""
-    pts = contour.reshape(-1, 2).astype(float)
-    dx = pts[:, 0] - cx
-    dy = pts[:, 1] - cy
-    dists = np.sqrt(dx ** 2 + dy ** 2)
-    ray_dx, ray_dy = fx - cx, fy - cy
-    ray_len = math.hypot(ray_dx, ray_dy)
-    if ray_len < 1e-6:
-        return None
-    ray_ux, ray_uy = ray_dx / ray_len, ray_dy / ray_len
-    dots = dx * ray_ux + dy * ray_uy
-    crosses = np.abs(dx * ray_uy - dy * ray_ux)
-    mask = (dots > 0) & (crosses < dists * 0.05 + 3)
-    if not np.any(mask):
-        return None
-    return float(np.median(dists[mask]))
-
-
-def sample_wall_thickness(outer, inner, n_samples: int = 360,
-                          mask: np.ndarray = None,
-                          center: tuple = None):
-    """Sample wall thickness at evenly-spaced angles around the ring.
-
-    Parameters
-    ----------
-    outer, inner : contours (used only as fallback when *mask* is None)
-    n_samples    : number of angular samples
-    mask         : binary mask of the ring (preferred — rotation-invariant)
-    center       : (cx, cy) ray origin; defaults to outer moments centroid
-
-    When *mask* is supplied the thickness at each angle is measured by
-    walking along a ray on the mask and detecting the 0→255 (inner edge)
-    and 255→0 (outer edge) transitions.  This is independent of contour
-    point density and therefore fully rotation-invariant.
-    """
-    # Determine centre
-    if center is not None:
-        cx, cy = center
-    else:
-        M = cv2.moments(outer)
-        if M["m00"] == 0:
-            return np.array([])
-        cx = M["m10"] / M["m00"]
-        cy = M["m01"] / M["m00"]
-
-    # ── Mask-based ray tracing (preferred) ────────────────────────────
-    if mask is not None:
-        h, w = mask.shape[:2]
-        max_r = int(math.hypot(w, h))
-        thicknesses = []
-        for i in range(n_samples):
-            angle = 2.0 * math.pi * i / n_samples
-            cos_a = math.cos(angle)
-            sin_a = math.sin(angle)
-            inner_r = None
-            outer_r = None
-            for r in range(1, max_r):
-                px = int(round(cx + r * cos_a))
-                py = int(round(cy + r * sin_a))
-                if not (0 <= px < w and 0 <= py < h):
-                    break
-                val = mask[py, px]
-                if inner_r is None:
-                    if val > 0:
-                        inner_r = r
-                else:
-                    if val == 0:
-                        outer_r = r
-                        break
-            if inner_r is not None and outer_r is not None:
-                thicknesses.append(float(outer_r - inner_r))
-        return np.array(thicknesses)
-
-    # ── Fallback: contour-point ray casting ───────────────────────────
-    thicknesses = []
-    for i in range(n_samples):
-        angle = 2.0 * math.pi * i / n_samples
-        far_x = cx + 2000 * math.cos(angle)
-        far_y = cy + 2000 * math.sin(angle)
-        d_outer = _ray_contour_distance(cx, cy, far_x, far_y, outer)
-        d_inner = _ray_contour_distance(cx, cy, far_x, far_y, inner)
-        if d_outer is not None and d_inner is not None and d_outer > d_inner:
-            thicknesses.append(d_outer - d_inner)
-    return np.array(thicknesses)
-
-
-def contour_distances(outer, inner, sample: int = 300):
-    """Fallback min / max wall thickness via pointPolygonTest."""
-    min_d, max_d = float("inf"), 0.0
-    for contour_a, contour_b in [(outer, inner), (inner, outer)]:
-        step = max(1, len(contour_a) // sample)
-        for i in range(0, len(contour_a), step):
-            pt = contour_a[i][0]
-            d = abs(cv2.pointPolygonTest(
-                contour_b, (float(pt[0]), float(pt[1])), True))
-            if d < min_d:
-                min_d = d
-            if d > max_d:
-                max_d = d
-    return (0.0 if min_d == float("inf") else float(min_d)), float(max_d)
-
-
-def edge_clearance(outer, inner, img_shape) -> float:
-    """Min distance from any contour point to the image border."""
-    h, w = img_shape[:2]
-    min_dist = float("inf")
-    for contour in [outer, inner]:
-        pts = contour.reshape(-1, 2)
-        d_left = pts[:, 0].min()
-        d_right = w - 1 - pts[:, 0].max()
-        d_top = pts[:, 1].min()
-        d_bottom = h - 1 - pts[:, 1].max()
-        min_dist = min(min_dist, d_left, d_right, d_top, d_bottom)
-    return float(min_dist) if min_dist != float("inf") else 0.0
-
-
 def auto_bg_value(image: np.ndarray, margin: int = 80) -> int:
-    """Estimate background intensity from the four image corners."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     corners = np.concatenate([
@@ -516,53 +285,18 @@ def auto_bg_value(image: np.ndarray, margin: int = 80) -> int:
     return int(np.median(corners))
 
 
-def measure_oring(image: np.ndarray,
-                  bg_value: int = 20,
+def measure_oring(image: np.ndarray, bg_value: int = 20,
                   threshold: int = 30) -> Optional[Dict]:
-    """Run full measurement pipeline on a BGR image.
-
-    Uses least-squares circle fitting (Kåsa method) instead of
-    ``cv2.minEnclosingCircle`` so that radius / centre estimates
-    are driven by *all* contour points rather than 2–3 extremes,
-    making them robust to rotation in discrete pixel space.
-
-    Wall thickness is sampled via mask-based ray tracing from the
-    fitted outer-circle centre, eliminating any dependency on
-    contour-point density.
-    """
     mask = build_mask(image, bg_value, threshold)
     outer, inner = find_contours(mask)
     if outer is None or inner is None:
         return None
 
-    h, w = image.shape[:2]
-
-    # Least-squares circle fit (rotation-invariant)
     ox, oy, orad = fit_circle_lsq(outer)
     ix, iy, irad = fit_circle_lsq(inner)
-    cdx, cdy = float(ox - ix), float(oy - iy)
-    cdist = math.hypot(cdx, cdy)
-    rthick = float(orad) - float(irad)
-    mrad = (float(orad) + float(irad)) / 2.0
+    cdist = math.hypot(ox - ix, oy - iy)
+    mrad = (orad + irad) / 2.0
 
-    # Wall thickness via mask-based ray sampling from fitted outer centre
-    thicknesses = sample_wall_thickness(
-        outer, inner, 360, mask=mask, center=(ox, oy))
-    if len(thicknesses) < 10:
-        min_t, max_t = contour_distances(outer, inner)
-        mean_t = (min_t + max_t) / 2.0
-        std_t = (max_t - min_t) / 4.0
-    else:
-        min_t = float(np.min(thicknesses))
-        max_t = float(np.max(thicknesses))
-        mean_t = float(np.mean(thicknesses))
-        std_t = float(np.std(thicknesses))
-
-    cv_t = (std_t / mean_t * 100) if mean_t > 0 else 0.0
-
-    area_px = int(np.count_nonzero(mask))
-
-    # Circularity: 4πA / P²
     o_area = cv2.contourArea(outer)
     o_peri = cv2.arcLength(outer, True)
     circ_o = (4.0 * math.pi * o_area / (o_peri ** 2)) if o_peri > 0 else 0.0
@@ -571,35 +305,13 @@ def measure_oring(image: np.ndarray,
     i_peri = cv2.arcLength(inner, True)
     circ_i = (4.0 * math.pi * i_area / (i_peri ** 2)) if i_peri > 0 else 0.0
 
-    o_rstd = radial_std(outer)
-    i_rstd = radial_std(inner)
-
-    ec = edge_clearance(outer, inner, image.shape)
-
     return {
         "outer_radius":      float(orad),
         "inner_radius":      float(irad),
         "center_dist":       cdist,
-        "center_dx":         cdx,
-        "center_dy":         cdy,
-        "ring_thickness":    rthick,
-        "mean_thickness":    mean_t,
-        "min_thickness":     min_t,
-        "max_thickness":     max_t,
-        "thickness_std":     std_t,
-        "thickness_cv":      cv_t,
-        "thickness_range":   max_t - min_t,
-        "thickness_ratio":   (max_t / min_t) if min_t > 0 else 99.0,
-        "mean_radius":       mrad,
-        "annular_area":      area_px,
-        "annular_area_k":    area_px / 1000.0,
         "eccentricity_pct":  (cdist / mrad * 100) if mrad > 0 else 0,
         "circularity_outer": circ_o,
         "circularity_inner": circ_i,
-        "outer_radial_std":  o_rstd,
-        "inner_radial_std":  i_rstd,
-        "edge_clearance":    ec,
-        # keep for overlay drawing
         "mask":              mask,
         "outer_contour":     outer,
         "inner_contour":     inner,
@@ -609,7 +321,6 @@ def measure_oring(image: np.ndarray,
 
 
 def draw_overlay(image: np.ndarray, result: Dict) -> np.ndarray:
-    """Draw contours, centres and offset line on a copy of the image."""
     vis = image.copy()
     outer, inner = result["outer_contour"], result["inner_contour"]
     ox, oy = result["outer_center"]
@@ -627,550 +338,358 @@ def draw_overlay(image: np.ndarray, result: Dict) -> np.ndarray:
     cv2.circle(vis, (int(ix), int(iy)), int(result["inner_radius"]),
                (0, 0, 255), 1, cv2.LINE_AA)
 
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.putText(vis, "Green = Outer", (20, 40), font, 1.0, (0, 255, 0), 2)
-    cv2.putText(vis, "Red   = Inner", (20, 80), font, 1.0, (0, 0, 255), 2)
-    cv2.putText(vis, "Yellow = Offset", (20, 120), font, 1.0, (0, 255, 255), 2)
-
     return vis
 
 
+# ── Eagerly import bin_and_crop (cached at module load) ──────────────────
+_binning_dir = str(WORKSPACE / "binning_pipeline")
+if _binning_dir not in sys.path:
+    sys.path.insert(0, _binning_dir)
+from bin_and_crop import binning_2x2, crop_to_foreground   # noqa: E402
+
+
+def bin_crop_720(image: np.ndarray) -> np.ndarray:
+    """2x2 bin + BG crop + resize/pad to 720x720."""
+    binned = binning_2x2(image)
+    cropped, _info = crop_to_foreground(
+        binned, bg_value=20, threshold=30, pad=10, target_size=720)
+    return cropped
+
+
 # ═══════════════════════════════════════════════════════════════════════════
-#  GUI
+#  Application state
 # ═══════════════════════════════════════════════════════════════════════════
 
-class InspectionGUI(QMainWindow):
-    """Main inspection window."""
-
+class AppState:
+    """Mutable application state — plain object, no signals."""
     def __init__(self):
-        super().__init__()
-        self.setWindowTitle("O-Ring Inspection — Pass / Rework / Reject")
-        self.setGeometry(40, 40, 1600, 960)
-
         self.image: Optional[np.ndarray] = None
         self.overlay_image: Optional[np.ndarray] = None
         self.result: Optional[Dict] = None
         self.result_normed: Optional[Dict] = None
-        self._resolution_scale: float = 1.0
+        self.resolution_scale: float = 1.0
+        self.verdict: str = "AWAITING"
 
-        # Defect detection models (lazy-loaded on first PASS verdict)
-        self._detector = None          # Mask R-CNN
-        self._yolo_detector = None     # YOLO v11
-        self._defect_model = "Mask R-CNN"  # Current selection
-        self._pred_overlay: Optional[np.ndarray] = None
-        self._pred_mask: Optional[np.ndarray] = None
-        self._pred_result: Optional[Dict] = None
+        # DL models (preloaded)
+        self.detector = None           # Mask R-CNN
+        self.maskrcnn_ready = False
+        self.maskrcnn_status = "loading..."
 
-        # Camera (Hikrobot)
-        self._camera = None
-        self._camera_streaming = False
-        self._stream_timer: Optional[QTimer] = None
-        self._latest_frame: Optional[np.ndarray] = None
+        # Current model / thresholds
+        self.current_model: str = DEFAULT_MODEL
+        self.good_stats = load_good_stats(MODEL_CSV[DEFAULT_MODEL])
+        self.sigma: float = 2.5
+        self.thresholds = load_best_thresholds(DEFAULT_MODEL, self.good_stats, 2.5)
+
+        # Camera
+        self.camera = None
+        self.camera_streaming = False
+        self.latest_frame: Optional[np.ndarray] = None
 
         # File navigation
-        self._file_list: list = []   # sorted image paths in current folder
-        self._file_index: int = -1   # current index in _file_list
+        self.file_list: list = []
+        self.file_index: int = -1
 
-        # Statistics & thresholds
-        self.current_model = DEFAULT_MODEL
-        self.good_stats = load_good_stats(MODEL_CSV[self.current_model])
-        self.sigma = 2.5
-        self.thresholds = self._load_best_thresholds()
+        # DL prediction results
+        self.pred_overlay: Optional[np.ndarray] = None
+        self.pred_result: Optional[Dict] = None
 
-        self.lo_spins: Dict[str, QDoubleSpinBox] = {}
-        self.hi_spins: Dict[str, QDoubleSpinBox] = {}
-        self.metric_checks: Dict[str, QCheckBox] = {}  # per-metric enable checkboxes
 
-        self._init_ui()
-        self._populate_table()
+# ═══════════════════════════════════════════════════════════════════════════
+#  DL model preloading (runs in background threads at startup)
+# ═══════════════════════════════════════════════════════════════════════════
 
-        tuned_path = TUNED_JSON.get(self.current_model)
-        if tuned_path and tuned_path.exists():
-            self.info_label.setText(
-                f"✓ Loaded tuned thresholds from {tuned_path.name}  "
-                f"({self.current_model})")
-        elif self.good_stats:
-            csv_name = MODEL_CSV[self.current_model].name
-            self.info_label.setText(
-                f"✓ Loaded σ-based thresholds from {csv_name}  "
-                f"({self.current_model}, σ = {self.sigma})")
-        else:
-            self.info_label.setText(
-                f"⚠ No threshold data for {self.current_model} — using defaults")
+def preload_models(state: AppState):
+    """Spawn daemon thread to load Mask R-CNN (FP32) with GPU warmup."""
 
-    # ── UI setup ──────────────────────────────────────────────────────────
-
-    def _init_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QHBoxLayout(central)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(8)
-
-        # ── LEFT: image + mask ────────────────────────────────────────────
-        left = QWidget()
-        left_lay = QVBoxLayout(left)
-        left_lay.setContentsMargins(0, 0, 0, 0)
-
-        self.img_label = QLabel("Load an image to begin inspection")
-        self.img_label.setAlignment(Qt.AlignCenter)
-        self.img_label.setMinimumSize(700, 500)
-        self.img_label.setStyleSheet(
-            "background:#2b2b2b; color:#aaa; font-size:16px; border-radius:6px;")
-        left_lay.addWidget(self.img_label, stretch=3)
-
-        self.mask_label = QLabel("Binary mask preview")
-        self.mask_label.setAlignment(Qt.AlignCenter)
-        self.mask_label.setMinimumHeight(200)
-        self.mask_label.setStyleSheet(
-            "background:#1f1f1f; color:#888; font-size:13px; border-radius:6px;")
-        left_lay.addWidget(self.mask_label, stretch=1)
-
-        # Mask R-CNN prediction row (720×720 crop → model)
-        pred_row = QHBoxLayout()
-        self.pred_overlay_label = QLabel("Defect model prediction (PASS images)")
-        self.pred_overlay_label.setAlignment(Qt.AlignCenter)
-        self.pred_overlay_label.setMinimumHeight(180)
-        self.pred_overlay_label.setStyleSheet(
-            "background:#1a1a2e; color:#666; font-size:11px; border-radius:6px;")
-        pred_row.addWidget(self.pred_overlay_label, stretch=1)
-
-        self.pred_mask_label = QLabel("Predicted defect mask")
-        self.pred_mask_label.setAlignment(Qt.AlignCenter)
-        self.pred_mask_label.setMinimumHeight(180)
-        self.pred_mask_label.setStyleSheet(
-            "background:#1a1a2e; color:#666; font-size:11px; border-radius:6px;")
-        pred_row.addWidget(self.pred_mask_label, stretch=1)
-        left_lay.addLayout(pred_row, stretch=1)
-
-        root.addWidget(left, stretch=3)
-
-        # ── RIGHT: controls + results ─────────────────────────────────────
-        right = QWidget()
-        right_lay = QVBoxLayout(right)
-        right_lay.setContentsMargins(0, 0, 0, 0)
-
-        # --- Detection settings -------------------------------------------
-        sg = QGroupBox("Detection Settings")
-        sl = QVBoxLayout()
-
-        # Model selector
-        model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("O-Ring Model:"))
-        self.model_combo = QComboBox()
-        self.model_combo.addItems(list(MODEL_CSV.keys()))
-        self.model_combo.setCurrentText(self.current_model)
-        self.model_combo.currentTextChanged.connect(self._on_model_changed)
-        self.model_combo.setStyleSheet("padding:3px 8px; font-size:13px;")
-        model_row.addWidget(self.model_combo)
-        sl.addLayout(model_row)
-
-        btn_row = QHBoxLayout()
-        self.load_btn = QPushButton("📁 Load Image")
-        self.load_btn.setStyleSheet("font-size:13px; padding:6px 14px;")
-        self.load_btn.clicked.connect(self.load_image)
-        btn_row.addWidget(self.load_btn)
-
-        self.analyze_btn = QPushButton("🔍 Analyze")
-        self.analyze_btn.setEnabled(False)
-        self.analyze_btn.setStyleSheet(
-            "font-size:13px; padding:6px 14px; "
-            "background:#4CAF50; color:white; font-weight:bold;")
-        self.analyze_btn.clicked.connect(self.analyze)
-        btn_row.addWidget(self.analyze_btn)
-        sl.addLayout(btn_row)
-
-        # Navigation buttons
-        nav_row = QHBoxLayout()
-        self.prev_btn = QPushButton("◀ Prev")
-        self.prev_btn.setEnabled(False)
-        self.prev_btn.setStyleSheet("font-size:13px; padding:6px 14px;")
-        self.prev_btn.clicked.connect(self._load_prev_image)
-        nav_row.addWidget(self.prev_btn)
-
-        self.nav_label = QLabel("")
-        self.nav_label.setAlignment(Qt.AlignCenter)
-        self.nav_label.setStyleSheet("color:#aaa; font-size:12px;")
-        nav_row.addWidget(self.nav_label)
-
-        self.next_btn = QPushButton("Next ▶")
-        self.next_btn.setEnabled(False)
-        self.next_btn.setStyleSheet("font-size:13px; padding:6px 14px;")
-        self.next_btn.clicked.connect(self._load_next_image)
-        nav_row.addWidget(self.next_btn)
-        sl.addLayout(nav_row)
-
-        # Camera controls
-        cam_row = QHBoxLayout()
-        self.stream_btn = QPushButton("📷 Start Stream")
-        self.stream_btn.setStyleSheet("font-size:13px; padding:6px 14px;")
-        self.stream_btn.clicked.connect(self._toggle_stream)
-        cam_row.addWidget(self.stream_btn)
-
-        self.capture_btn = QPushButton("📸 Capture")
-        self.capture_btn.setEnabled(False)
-        self.capture_btn.setStyleSheet(
-            "font-size:13px; padding:6px 14px; "
-            "background:#1976D2; color:white; font-weight:bold;")
-        self.capture_btn.clicked.connect(self._capture_frame)
-        cam_row.addWidget(self.capture_btn)
-        sl.addLayout(cam_row)
-
-        param_row = QHBoxLayout()
-        param_row.addWidget(QLabel("BG Value:"))
-        self.bg_spin = QSpinBox()
-        self.bg_spin.setRange(0, 255)
-        self.bg_spin.setValue(20)
-        param_row.addWidget(self.bg_spin)
-
-        self.auto_bg_btn = QPushButton("Auto")
-        self.auto_bg_btn.setToolTip("Detect background from image corners")
-        self.auto_bg_btn.setFixedWidth(50)
-        self.auto_bg_btn.clicked.connect(self._auto_bg)
-        param_row.addWidget(self.auto_bg_btn)
-
-        param_row.addSpacing(12)
-        param_row.addWidget(QLabel("Threshold:"))
-        self.thresh_spin = QSpinBox()
-        self.thresh_spin.setRange(1, 255)
-        self.thresh_spin.setValue(30)
-        param_row.addWidget(self.thresh_spin)
-        sl.addLayout(param_row)
-
-        # Defect detection model selector
-        defect_model_row = QHBoxLayout()
-        defect_model_row.addWidget(QLabel("Defect Model:"))
-        self.defect_model_combo = QComboBox()
-        self.defect_model_combo.addItems(DEFECT_MODEL_OPTIONS)
-        self.defect_model_combo.setCurrentText(self._defect_model)
-        self.defect_model_combo.currentTextChanged.connect(self._on_defect_model_changed)
-        self.defect_model_combo.setStyleSheet("padding:3px 8px; font-size:13px;")
-        defect_model_row.addWidget(self.defect_model_combo)
-        sl.addLayout(defect_model_row)
-
-        sg.setLayout(sl)
-        right_lay.addWidget(sg)
-
-        # --- Verdict banner -----------------------------------------------
-        self.verdict_frame = QFrame()
-        self.verdict_frame.setMinimumHeight(110)
-        self.verdict_frame.setStyleSheet(
-            "background:#555; border-radius:12px; padding:8px;")
-        vfl = QVBoxLayout(self.verdict_frame)
-        self.verdict_label = QLabel("AWAITING")
-        self.verdict_label.setAlignment(Qt.AlignCenter)
-        self.verdict_label.setFont(QFont("Arial", 32, QFont.Bold))
-        self.verdict_label.setStyleSheet("color:#ccc;")
-        vfl.addWidget(self.verdict_label)
-        self.verdict_detail = QLabel("Load an image and click Analyze")
-        self.verdict_detail.setAlignment(Qt.AlignCenter)
-        self.verdict_detail.setFont(QFont("Arial", 10))
-        self.verdict_detail.setStyleSheet("color:#bbb;")
-        self.verdict_detail.setWordWrap(True)
-        vfl.addWidget(self.verdict_detail)
-        right_lay.addWidget(self.verdict_frame)
-
-        # --- Sigma / reset ------------------------------------------------
-        tg = QGroupBox("Threshold Settings")
-        tl = QHBoxLayout()
-        tl.addWidget(QLabel("σ multiplier:"))
-        self.sigma_spin = QDoubleSpinBox()
-        self.sigma_spin.setRange(1.0, 5.0)
-        self.sigma_spin.setSingleStep(0.25)
-        self.sigma_spin.setDecimals(2)
-        self.sigma_spin.setValue(self.sigma)
-        self.sigma_spin.valueChanged.connect(self._recompute_thresholds)
-        tl.addWidget(self.sigma_spin)
-        reset_btn = QPushButton("🔄 Reset")
-        reset_btn.setToolTip("Reset all thresholds to σ = 2.5")
-        reset_btn.clicked.connect(self._reset_thresholds)
-        tl.addWidget(reset_btn)
-        tg.setLayout(tl)
-        right_lay.addWidget(tg)
-
-        # --- Metric selection controls ------------------------------------
-        sel_group = QGroupBox("Active Metrics")
-        sel_lay = QHBoxLayout()
-
-        rework_sel_lay = QVBoxLayout()
-        rework_sel_label = QLabel("Rework")
-        rework_sel_label.setStyleSheet("color:#FF9800; font-weight:bold; font-size:11px;")
-        rework_sel_lay.addWidget(rework_sel_label)
-        rework_btn_row = QHBoxLayout()
-        self.rework_all_btn = QPushButton("All")
-        self.rework_all_btn.setFixedWidth(50)
-        self.rework_all_btn.clicked.connect(lambda: self._set_category_checks("rework", True))
-        rework_btn_row.addWidget(self.rework_all_btn)
-        self.rework_none_btn = QPushButton("None")
-        self.rework_none_btn.setFixedWidth(50)
-        self.rework_none_btn.clicked.connect(lambda: self._set_category_checks("rework", False))
-        rework_btn_row.addWidget(self.rework_none_btn)
-        rework_btn_row.addStretch()
-        rework_sel_lay.addLayout(rework_btn_row)
-        sel_lay.addLayout(rework_sel_lay)
-
-        sel_lay.addSpacing(16)
-
-        reject_sel_lay = QVBoxLayout()
-        reject_sel_label = QLabel("Reject")
-        reject_sel_label.setStyleSheet("color:#B71C1C; font-weight:bold; font-size:11px;")
-        reject_sel_lay.addWidget(reject_sel_label)
-        reject_btn_row = QHBoxLayout()
-        self.reject_all_btn = QPushButton("All")
-        self.reject_all_btn.setFixedWidth(50)
-        self.reject_all_btn.clicked.connect(lambda: self._set_category_checks("reject", True))
-        reject_btn_row.addWidget(self.reject_all_btn)
-        self.reject_none_btn = QPushButton("None")
-        self.reject_none_btn.setFixedWidth(50)
-        self.reject_none_btn.clicked.connect(lambda: self._set_category_checks("reject", False))
-        reject_btn_row.addWidget(self.reject_none_btn)
-        reject_btn_row.addStretch()
-        reject_sel_lay.addLayout(reject_btn_row)
-        sel_lay.addLayout(reject_sel_lay)
-
-        sel_lay.addStretch()
-        sel_group.setLayout(sel_lay)
-        right_lay.addWidget(sel_group)
-
-        # --- Metrics table ------------------------------------------------
-        mg = QGroupBox("Measurements && Thresholds  (editable)")
-        ml = QVBoxLayout()
-        self.table = QTableWidget()
-        self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(
-            ["On", "Metric", "Measured", "Min", "Max", "Status", "Category"])
-        hdr = self.table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
-        for c in (2, 3, 4, 5, 6):
-            hdr.setSectionResizeMode(c, QHeaderView.ResizeToContents)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setRowCount(len(METRIC_DEFS))
-        self.table.setSelectionMode(QTableWidget.NoSelection)
-        self.table.setAlternatingRowColors(True)
-        ml.addWidget(self.table)
-        mg.setLayout(ml)
-        right_lay.addWidget(mg, stretch=1)
-
-        # --- Extra info line ----------------------------------------------
-        self.info_label = QLabel("")
-        self.info_label.setStyleSheet("color:#888; font-size:10px;")
-        self.info_label.setWordWrap(True)
-        right_lay.addWidget(self.info_label)
-
-        root.addWidget(right, stretch=2)
-
-    def _populate_table(self):
-        """Fill table rows with metric labels, threshold spinboxes, and enable checkboxes."""
-        for row, (key, name, unit, ttype, dec, step, s_lo, s_hi, category) in \
-                enumerate(METRIC_DEFS):
-            label = f"{name}" + (f"  ({unit})" if unit else "")
-
-            # Col 0  – enable checkbox
-            chk = QCheckBox()
-            chk.setChecked(True)
-            chk.setToolTip(f"Include '{name}' in verdict evaluation")
-            chk.stateChanged.connect(self._on_metric_check_changed)
-            # Wrap in a centered widget
-            chk_widget = QWidget()
-            chk_lay = QHBoxLayout(chk_widget)
-            chk_lay.addWidget(chk)
-            chk_lay.setAlignment(Qt.AlignCenter)
-            chk_lay.setContentsMargins(0, 0, 0, 0)
-            self.table.setCellWidget(row, 0, chk_widget)
-            self.metric_checks[key] = chk
-
-            # Col 1  – metric name
-            item1 = QTableWidgetItem(label)
-            item1.setFlags(item1.flags() & ~Qt.ItemIsEditable)
-            if self.good_stats and key in self.good_stats:
-                gs = self.good_stats[key]
-                item1.setToolTip(
-                    f"Good samples: {gs['mean']:.2f} ± {gs['std']:.2f}")
-            self.table.setItem(row, 1, item1)
-
-            # Col 2  – measured value (placeholder)
-            item2 = QTableWidgetItem("—")
-            item2.setFlags(item2.flags() & ~Qt.ItemIsEditable)
-            item2.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 2, item2)
-
-            # Col 3  – lo threshold spinbox
-            lo_spin = QDoubleSpinBox()
-            lo_spin.setDecimals(dec)
-            lo_spin.setSingleStep(step)
-            lo_spin.setRange(s_lo, s_hi)
-            lo_val = self.thresholds[key]["lo"]
-            lo_spin.setValue(max(s_lo, min(lo_val, s_hi)))
-            lo_spin.valueChanged.connect(self._on_threshold_edited)
-            if ttype == "max":
-                lo_spin.setEnabled(False)
-                lo_spin.setStyleSheet("color:#666; background:#3a3a3a;")
-            self.table.setCellWidget(row, 3, lo_spin)
-            self.lo_spins[key] = lo_spin
-
-            # Col 4  – hi threshold spinbox
-            hi_spin = QDoubleSpinBox()
-            hi_spin.setDecimals(dec)
-            hi_spin.setSingleStep(step)
-            hi_spin.setRange(s_lo, s_hi)
-            hi_val = self.thresholds[key]["hi"]
-            hi_spin.setValue(max(s_lo, min(hi_val, s_hi)))
-            hi_spin.valueChanged.connect(self._on_threshold_edited)
-            if ttype == "min":
-                hi_spin.setEnabled(False)
-                hi_spin.setStyleSheet("color:#666; background:#3a3a3a;")
-            self.table.setCellWidget(row, 4, hi_spin)
-            self.hi_spins[key] = hi_spin
-
-            # Col 5  – status
-            item5 = QTableWidgetItem("—")
-            item5.setFlags(item5.flags() & ~Qt.ItemIsEditable)
-            item5.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 5, item5)
-
-            # Col 6  – category (REWORK / REJECT)
-            cat_label = "REWORK" if category == "rework" else "REJECT"
-            cat_color = QColor(255, 152, 0) if category == "rework" else QColor(183, 28, 28)
-            item6 = QTableWidgetItem(cat_label)
-            item6.setFlags(item6.flags() & ~Qt.ItemIsEditable)
-            item6.setTextAlignment(Qt.AlignCenter)
-            item6.setForeground(cat_color)
-            self.table.setItem(row, 6, item6)
-
-    # ── Threshold helpers ────────────────────────────────────────────────
-
-    def _sync_thresholds_to_table(self):
-        """Push self.thresholds → spinboxes (without triggering signals)."""
-        for key in self.lo_spins:
-            self.lo_spins[key].blockSignals(True)
-            self.hi_spins[key].blockSignals(True)
-            lo_val = self.thresholds[key]["lo"]
-            hi_val = self.thresholds[key]["hi"]
-            sp_lo = self.lo_spins[key]
-            sp_hi = self.hi_spins[key]
-            sp_lo.setValue(max(sp_lo.minimum(), min(lo_val, sp_lo.maximum())))
-            sp_hi.setValue(max(sp_hi.minimum(), min(hi_val, sp_hi.maximum())))
-            self.lo_spins[key].blockSignals(False)
-            self.hi_spins[key].blockSignals(False)
-
-    def _read_thresholds_from_table(self):
-        """Read spinbox values → self.thresholds."""
-        for key in self.lo_spins:
-            self.thresholds[key] = {
-                "lo": self.lo_spins[key].value(),
-                "hi": self.hi_spins[key].value(),
-            }
-
-    # ── Defect model selection ────────────────────────────────────────────
-
-    def _on_defect_model_changed(self, model_name: str):
-        """Called when user changes defect model dropdown."""
-        self._defect_model = model_name
-        print(f"Defect model changed to: {model_name}")
-
-    # ── Metric checkbox helpers ──────────────────────────────────────────
-
-    def _on_metric_check_changed(self, _state=None):
-        """Re-evaluate verdict when a metric checkbox is toggled."""
-        if self.result is not None:
-            self._evaluate()
-
-    def _set_category_checks(self, category: str, checked: bool):
-        """Set all checkboxes in a category to checked/unchecked."""
-        for key, _name, _unit, _ttype, *_, cat in METRIC_DEFS:
-            if cat == category and key in self.metric_checks:
-                self.metric_checks[key].blockSignals(True)
-                self.metric_checks[key].setChecked(checked)
-                self.metric_checks[key].blockSignals(False)
-        # Re-evaluate once after batch update
-        if self.result is not None:
-            self._evaluate()
-
-    # ── YOLO v11 helpers ─────────────────────────────────────────────────
-
-    def _ensure_yolo_detector(self) -> bool:
-        """Lazy-load the YOLO v11 model. Returns True if ready."""
-        if self._yolo_detector is not None:
-            return True
-        if not YOLO_CHECKPOINT.exists():
-            print(f"⚠ YOLO checkpoint not found: {YOLO_CHECKPOINT}")
-            return False
+    def _load_maskrcnn():
         try:
-            from ultralytics import YOLO as UltralyticsYOLO
-            self._yolo_detector = UltralyticsYOLO(str(YOLO_CHECKPOINT))
-            return True
-        except Exception as e:
-            print(f"⚠ Failed to load YOLO v11: {e}")
-            return False
+            if not MASKRCNN_CHECKPOINT.exists():
+                state.maskrcnn_status = "checkpoint not found"
+                return
+            maskrcnn_dir = str(WORKSPACE / "maskrcnn")
+            if maskrcnn_dir not in sys.path:
+                sys.path.insert(0, maskrcnn_dir)
+            from inference import OringDefectDetector
 
-    def _run_yolo_on_pass(self):
-        """Called after geometric verdict is PASS (YOLO v11 mode).
-        Crop to 720×720, run YOLO segmentation, display results.
-        Returns True if defects found (override to REJECT).
-        """
-        if self.image is None:
-            return False
+            use_cuda = torch.cuda.is_available()
+            device_str = "cuda" if use_cuda else "cpu"
 
-        if not self._ensure_yolo_detector():
-            self.pred_overlay_label.setText("⚠ YOLO v11 model not available")
-            self.pred_mask_label.setText("")
-            return False
-
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            # Bin + crop to 720×720
-            img_720 = self._bin_crop_720(self.image)
-
-            # Run YOLO inference
-            results = self._yolo_detector.predict(
-                img_720, conf=0.5, iou=0.45, verbose=False,
-                device="cuda" if torch.cuda.is_available() else "cpu"
+            state.maskrcnn_status = "loading weights..."
+            state.detector = OringDefectDetector(
+                model_name="combined",
+                checkpoint_path=str(MASKRCNN_CHECKPOINT),
+                device=device_str,
+                score_threshold=0.5,
+                mask_threshold=0.5,
             )
-            result = results[0]
 
-            # Extract detections
-            boxes = result.boxes
-            num_det = len(boxes) if boxes is not None else 0
-            has_defect = num_det > 0
+            # ── GPU warmup (3 dummy forward passes for consistent timing) ──
+            state.maskrcnn_status = "warming up GPU..."
+            dummy = torch.zeros(3, 720, 720, dtype=torch.float32)
+            if use_cuda:
+                dummy = dummy.cuda()
+            for _ in range(3):
+                with torch.no_grad():
+                    state.detector.model([dummy])
+            if use_cuda:
+                torch.cuda.synchronize()
+            del dummy
 
-            scores = boxes.conf.cpu().numpy().tolist() if num_det > 0 else []
-            labels = boxes.cls.cpu().numpy().astype(int).tolist() if num_det > 0 else []
+            state.maskrcnn_ready = True
+            state.maskrcnn_status = "ready"
+        except Exception as e:
+            state.maskrcnn_status = f"error: {e}"
 
-            # Build prediction result dict (compatible with existing code)
-            self._pred_result = {
-                "num_detections": num_det,
-                "has_defect": has_defect,
-                "scores": scores,
-                "labels": labels,
-            }
+    t1 = threading.Thread(target=_load_maskrcnn, daemon=True)
+    t1.start()
 
-            # Draw overlay with predictions
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Helpers for Dear PyGui textures
+# ═══════════════════════════════════════════════════════════════════════════
+
+def cv_to_dpg(cv_img: np.ndarray, target_w: int = IMG_W,
+              target_h: int = IMG_H) -> np.ndarray:
+    """Convert BGR cv2 image → RGBA float32 flat array for DPG raw texture."""
+    if len(cv_img.shape) == 2:
+        cv_img = cv2.cvtColor(cv_img, cv2.COLOR_GRAY2BGR)
+    h, w = cv_img.shape[:2]
+    scale = min(target_w / w, target_h / h)
+    nw, nh = int(w * scale), int(h * scale)
+    resized = cv2.resize(cv_img, (nw, nh), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    y0 = (target_h - nh) // 2
+    x0 = (target_w - nw) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw] = resized
+    rgba = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGBA)
+    return (rgba.astype(np.float32) / 255.0).flatten()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Build GUI
+# ═══════════════════════════════════════════════════════════════════════════
+
+def build_gui(state: AppState, default_font=None, large_font=None,
+              heading_font=None, status_font=None):
+    """Create the entire Dear PyGui UI. Returns the _frame_update callback."""
+
+    # ── Themes ────────────────────────────────────────────────────────────
+    with dpg.theme() as theme_btn_active:
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (33, 150, 243))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (66, 165, 245))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (25, 118, 210))
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 255, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_Border, (100, 200, 255))
+            dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 2)
+
+    with dpg.theme() as theme_btn_inactive:
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (50, 50, 58))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (65, 65, 78))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (50, 50, 58))
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (160, 160, 165))
+
+    with dpg.theme() as theme_btn_disabled:
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (50, 50, 50))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (50, 50, 50))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (50, 50, 50))
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (100, 100, 100))
+
+    with dpg.theme() as theme_pass:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (27, 94, 32))
+            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 12)
+
+    with dpg.theme() as theme_rework:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (230, 126, 34))
+            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 12)
+
+    with dpg.theme() as theme_reject:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (211, 47, 47))
+            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 12)
+
+    with dpg.theme() as theme_awaiting:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (55, 55, 64))
+            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 12)
+
+    # Green-tinted theme for "ready" status indicators
+    with dpg.theme() as theme_status_ready:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (100, 220, 100))
+
+    with dpg.theme() as theme_status_loading:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 193, 7))
+
+    with dpg.theme() as theme_status_error:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (244, 67, 54))
+
+    # Accent button theme (for Load / Analyze)
+    with dpg.theme() as theme_btn_green:
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (56, 142, 60))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (76, 175, 80))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (46, 125, 50))
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 255, 255))
+
+    with dpg.theme() as theme_btn_orange:
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (230, 126, 34))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (243, 156, 18))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (211, 84, 0))
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 255, 255))
+
+    themes = {
+        "active": theme_btn_active,
+        "inactive": theme_btn_inactive,
+        "disabled": theme_btn_disabled,
+        "pass": theme_pass,
+        "rework": theme_rework,
+        "reject": theme_reject,
+        "awaiting": theme_awaiting,
+        "status_ready": theme_status_ready,
+        "status_loading": theme_status_loading,
+        "status_error": theme_status_error,
+        "btn_green": theme_btn_green,
+        "btn_orange": theme_btn_orange,
+    }
+
+    # ── Texture registry ─────────────────────────────────────────────────
+    blank = [0.0] * (IMG_W * IMG_H * 4)
+    with dpg.texture_registry():
+        dpg.add_raw_texture(IMG_W, IMG_H, blank, tag="tex_main",
+                            format=dpg.mvFormat_Float_rgba)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Define ALL helper / callback functions BEFORE creating widgets
+    # ══════════════════════════════════════════════════════════════════════
+
+    # -- Display helpers --------------------------------------------------
+
+    def _show_image(cv_img: np.ndarray):
+        """Push a cv2 BGR image to the DPG texture."""
+        data = cv_to_dpg(cv_img)
+        dpg.set_value("tex_main", data)
+
+    # -- Model button helpers ---------------------------------------------
+
+    def _update_model_btns():
+        m = state.current_model
+        dpg.bind_item_theme("btn_model1",
+                            themes["active"] if m == "Model 1" else themes["inactive"])
+        dpg.bind_item_theme("btn_model2",
+                            themes["active"] if m == "Model 2" else themes["inactive"])
+
+    # -- Threshold helpers ------------------------------------------------
+
+    def _sync_thresholds_to_ui():
+        """Push state.thresholds → DPG input widgets."""
+        for key, *_ in METRIC_DEFS:
+            lo_tag = f"lo_{key}"
+            hi_tag = f"hi_{key}"
+            if dpg.does_item_exist(lo_tag):
+                dpg.set_value(lo_tag, state.thresholds[key]["lo"])
+            if dpg.does_item_exist(hi_tag):
+                dpg.set_value(hi_tag, state.thresholds[key]["hi"])
+
+    def _read_thresholds_from_ui():
+        """Read DPG input widget values → state.thresholds."""
+        for key, *_ in METRIC_DEFS:
+            lo_tag = f"lo_{key}"
+            hi_tag = f"hi_{key}"
+            if dpg.does_item_exist(lo_tag):
+                state.thresholds[key]["lo"] = dpg.get_value(lo_tag)
+            if dpg.does_item_exist(hi_tag):
+                state.thresholds[key]["hi"] = dpg.get_value(hi_tag)
+
+    # -- Analyze / navigation state helpers --------------------------------
+
+    def _update_analyze_btn():
+        has_img = state.image is not None
+        dpg.bind_item_theme("btn_analyze",
+                            themes["active"] if has_img else themes["disabled"])
+
+    def _update_nav_btns():
+        n = len(state.file_list)
+        idx = state.file_index
+        dpg.configure_item("btn_prev", enabled=(idx > 0))
+        dpg.configure_item("btn_next", enabled=(idx < n - 1))
+        dpg.set_value("nav_label", f"{idx + 1} / {n}" if n > 0 else "")
+
+    # -- Clear results ----------------------------------------------------
+
+    def _clear_results():
+        for key, name, unit, *_ in METRIC_DEFS:
+            dpg.set_value(f"val_{key}", "-")
+            dpg.set_value(f"status_{key}", "-")
+        dpg.set_value("verdict_text", "AWAITING")
+        dpg.bind_item_theme("verdict_box", themes["awaiting"])
+        dpg.set_value("cycle_time_text", "")
+        state.verdict = "AWAITING"
+        state.pred_overlay = None
+        state.pred_result = None
+
+    # -- DL inference helpers (Mask R-CNN) ---------------------------------
+
+    def _predict_maskrcnn(img_720: np.ndarray, det_thresh: float) -> Dict:
+        """Run Mask R-CNN inference (FP32) with CUDA sync for consistent timing."""
+        img_rgb = cv2.cvtColor(img_720, cv2.COLOR_BGR2RGB)
+        t = torch.as_tensor(img_rgb, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        t = t.to(state.detector.device)
+
+        with torch.no_grad():
+            outputs = state.detector.model([t])[0]
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        keep = outputs["scores"] >= det_thresh
+        scores = outputs["scores"][keep].cpu().numpy()
+        if "masks" in outputs and keep.sum() > 0:
+            masks = (outputs["masks"][keep].squeeze(1) > 0.5).cpu().numpy().astype(np.uint8)
+        else:
+            masks = np.zeros((0, img_720.shape[0], img_720.shape[1]), dtype=np.uint8)
+        return {
+            "masks": masks,
+            "scores": scores,
+            "num_detections": len(scores),
+            "has_defect": len(scores) > 0,
+        }
+
+    def _run_maskrcnn_on_pass(precomputed_720: Optional[np.ndarray] = None) -> bool:
+        if state.image is None or not state.maskrcnn_ready:
+            return False
+        try:
+            det_thresh = dpg.get_value("spin_det_thresh")
+            img_720 = precomputed_720 if precomputed_720 is not None else bin_crop_720(state.image)
+            pred = _predict_maskrcnn(img_720, det_thresh)
+            state.pred_result = pred
+
+            # Draw mask-only overlay (no bounding boxes)
             overlay = img_720.copy()
-            h, w = img_720.shape[:2]
-            combined_mask = np.zeros((h, w), dtype=np.uint8)
-
-            if result.masks is not None and num_det > 0:
-                masks_data = result.masks.data.cpu().numpy()  # (N, H, W)
-                for i in range(num_det):
-                    mask_i = cv2.resize(
-                        masks_data[i], (w, h),
-                        interpolation=cv2.INTER_LINEAR
-                    )
-                    binary = (mask_i > 0.5).astype(np.uint8)
-                    combined_mask = np.maximum(combined_mask, binary * 255)
-
-                    # Draw mask overlay
-                    color_mask = np.zeros_like(overlay)
-                    color_mask[:, :, 2] = binary * 255  # Red channel
-                    overlay = cv2.addWeighted(overlay, 1.0, color_mask, 0.4, 0)
-
-                    # Draw contours
+            masks = pred["masks"]
+            scores = pred["scores"]
+            for i in range(len(scores)):
+                if masks is not None and i < len(masks):
+                    mask_i = masks[i]
+                    if mask_i.shape != img_720.shape[:2]:
+                        mask_i = cv2.resize(mask_i.astype(np.uint8),
+                                            (img_720.shape[1], img_720.shape[0]))
+                    color_overlay = overlay.copy()
+                    color_overlay[mask_i > 0.5] = (0, 0, 255)
+                    overlay = cv2.addWeighted(overlay, 0.6, color_overlay, 0.4, 0)
+                    # Draw mask contour
                     contours, _ = cv2.findContours(
-                        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        (mask_i > 0.5).astype(np.uint8),
+                        cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     cv2.drawContours(overlay, contours, -1, (0, 0, 255), 2)
-
-                    # Draw score
+                    # Confidence label at mask centroid
                     if len(contours) > 0:
                         M = cv2.moments(contours[0])
                         if M["m00"] > 0:
@@ -1178,320 +697,39 @@ class InspectionGUI(QMainWindow):
                             cy = int(M["m01"] / M["m00"])
                             cv2.putText(overlay, f"{scores[i]:.0%}",
                                         (cx - 20, cy),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                                         (255, 255, 255), 2)
-
-            self._pred_overlay = overlay
-            self._show_cv(overlay, self.pred_overlay_label)
-
-            self._pred_mask = combined_mask
-            self._show_cv(combined_mask, self.pred_mask_label)
-
-            return has_defect
-        except Exception as e:
-            print(f"⚠ YOLO v11 inference failed: {e}")
-            import traceback; traceback.print_exc()
-            self.pred_overlay_label.setText(f"⚠ YOLO inference error: {e}")
-            return False
-        finally:
-            QApplication.restoreOverrideCursor()
-
-    # ── Mask R-CNN helpers ───────────────────────────────────────────────
-
-    def _ensure_detector(self) -> bool:
-        """Lazy-load the Mask R-CNN model. Returns True if ready."""
-        if self._detector is not None:
-            return True
-        if not MASKRCNN_CHECKPOINT.exists():
-            print(f"⚠ Checkpoint not found: {MASKRCNN_CHECKPOINT}")
-            return False
-        try:
-            # Temporarily add maskrcnn dir to path for imports
-            maskrcnn_dir = str(WORKSPACE / "maskrcnn")
-            if maskrcnn_dir not in sys.path:
-                sys.path.insert(0, maskrcnn_dir)
-            from inference import OringDefectDetector
-            self._detector = OringDefectDetector(
-                model_name="combined",
-                checkpoint_path=str(MASKRCNN_CHECKPOINT),
-                device="cuda" if torch.cuda.is_available() else "cpu",
-                score_threshold=0.5,
-                mask_threshold=0.5,
-            )
-            return True
-        except Exception as e:
-            print(f"⚠ Failed to load Mask R-CNN: {e}")
-            return False
-
-    def _bin_crop_720(self, image: np.ndarray) -> np.ndarray:
-        """2×2 bin + BG crop + resize/pad to 720×720 (same as training pipeline)."""
-        # Import from binning_pipeline
-        binning_dir = str(WORKSPACE / "binning_pipeline")
-        if binning_dir not in sys.path:
-            sys.path.insert(0, binning_dir)
-        from bin_and_crop import binning_2x2, crop_to_foreground
-
-        binned = binning_2x2(image)
-        cropped, _info = crop_to_foreground(binned, bg_value=20, threshold=30,
-                                            pad=10, target_size=720)
-        return cropped
-
-    def _run_maskrcnn(self, image_720: np.ndarray) -> Dict:
-        """Run Mask R-CNN prediction on a 720×720 image.
-        Returns prediction dict with boxes, masks, scores, labels, has_defect.
-        """
-        return self._detector.predict(image_720)
-
-    def _run_maskrcnn_on_pass(self):
-        """Called after geometric verdict is PASS.
-        Crop to 720×720, run binary Mask R-CNN, display results.
-        Returns True if defects found (override to REJECT).
-        """
-        if self.image is None:
-            return False
-
-        if not self._ensure_detector():
-            self.pred_overlay_label.setText("⚠ Model not available")
-            self.pred_mask_label.setText("")
-            return False
-
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            # Bin + crop to 720×720
-            img_720 = self._bin_crop_720(self.image)
-
-            # Run Mask R-CNN
-            pred = self._run_maskrcnn(img_720)
-            self._pred_result = pred
-
-            # Draw prediction overlay
-            maskrcnn_dir = str(WORKSPACE / "maskrcnn")
-            if maskrcnn_dir not in sys.path:
-                sys.path.insert(0, maskrcnn_dir)
-            from utils import draw_predictions
-
-            self._pred_overlay = draw_predictions(
-                img_720, pred["boxes"], pred["masks"],
-                pred["scores"], pred["labels"],
-                score_threshold=0.5, mask_alpha=0.4)
-            self._show_cv(self._pred_overlay, self.pred_overlay_label)
-
-            # Build combined defect mask image
-            h, w = img_720.shape[:2]
-            if pred["num_detections"] > 0:
-                combined_mask = np.zeros((h, w), dtype=np.uint8)
-                for m in pred["masks"]:
-                    combined_mask = np.maximum(combined_mask, m * 255)
-                self._pred_mask = combined_mask
-            else:
-                self._pred_mask = np.zeros((h, w), dtype=np.uint8)
-            self._show_cv(self._pred_mask, self.pred_mask_label)
-
+            state.pred_overlay = overlay
             return pred["has_defect"]
         except Exception as e:
-            print(f"⚠ Mask R-CNN inference failed: {e}")
-            import traceback; traceback.print_exc()
-            self.pred_overlay_label.setText(f"⚠ Inference error: {e}")
+            print(f"Mask R-CNN inference failed: {e}")
             return False
-        finally:
-            QApplication.restoreOverrideCursor()
 
-    # ── Actions ──────────────────────────────────────────────────────────
+    # -- Evaluate metrics -------------------------------------------------
 
-    def load_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select O-Ring Image", "",
-            "Images (*.bmp *.jpg *.jpeg *.png *.tiff);;All Files (*)")
-        if not path:
-            return
-        img = cv2.imread(path)
-        if img is None:
-            QMessageBox.warning(self, "Error", f"Cannot read:\n{path}")
+    def _evaluate():
+        """Compare each metric against thresholds and issue verdict."""
+        if state.result is None:
             return
 
-        self.image = img
-        self.overlay_image = None
-        self.result = None
-        self._show_cv(img, self.img_label)
-        self.mask_label.setText("Click  🔍 Analyze  to process")
-        self.mask_label.setPixmap(QPixmap())
-        self.analyze_btn.setEnabled(True)
-        self._clear_results()
-
-        # Build file list for navigation
-        folder = str(Path(path).parent)
-        exts = {'.bmp', '.jpg', '.jpeg', '.png', '.tiff'}
-        files = sorted(
-            [os.path.join(folder, f) for f in os.listdir(folder)
-             if Path(f).suffix.lower() in exts],
-            key=lambda p: Path(p).name.lower()
-        )
-        self._file_list = files
-        try:
-            self._file_index = files.index(os.path.normpath(path))
-        except ValueError:
-            self._file_index = 0
-        self._update_nav_buttons()
-
-        h, w = img.shape[:2]
-        self.info_label.setText(f"Loaded: {Path(path).name}  ({w}×{h})")
-        self.setWindowTitle(f"O-Ring Inspection — {Path(path).name}")
-
-    def _auto_bg(self):
-        if self.image is None:
-            QMessageBox.information(self, "No Image", "Load an image first.")
-            return
-        val = auto_bg_value(self.image)
-        self.bg_spin.setValue(val)
-        self.info_label.setText(
-            f"Auto BG: median corner intensity = {val}")
-
-    # ── File navigation ──────────────────────────────────────────────────
-
-    def _update_nav_buttons(self):
-        """Enable/disable prev/next buttons and update counter label."""
-        n = len(self._file_list)
-        idx = self._file_index
-        self.prev_btn.setEnabled(idx > 0)
-        self.next_btn.setEnabled(idx < n - 1)
-        if n > 0:
-            self.nav_label.setText(f"{idx + 1} / {n}")
-        else:
-            self.nav_label.setText("")
-
-    def _load_image_at_index(self, index: int):
-        """Load an image by index from the current file list."""
-        if index < 0 or index >= len(self._file_list):
-            return
-        path = self._file_list[index]
-        img = cv2.imread(path)
-        if img is None:
-            QMessageBox.warning(self, "Error", f"Cannot read:\n{path}")
-            return
-
-        self._file_index = index
-        self.image = img
-        self.overlay_image = None
-        self.result = None
-        self._show_cv(img, self.img_label)
-        self.mask_label.setText("Click  🔍 Analyze  to process")
-        self.mask_label.setPixmap(QPixmap())
-        self.analyze_btn.setEnabled(True)
-        self._clear_results()
-        self._update_nav_buttons()
-
-        h, w = img.shape[:2]
-        self.info_label.setText(f"Loaded: {Path(path).name}  ({w}×{h})")
-        self.setWindowTitle(f"O-Ring Inspection — {Path(path).name}")
-
-    def _load_prev_image(self):
-        """Navigate to the previous image in the folder."""
-        self._load_image_at_index(self._file_index - 1)
-
-    def _load_next_image(self):
-        """Navigate to the next image in the folder."""
-        self._load_image_at_index(self._file_index + 1)
-
-    def analyze(self):
-        if self.image is None:
-            return
-        bg = self.bg_spin.value()
-        th = self.thresh_spin.value()
-
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            self.result = measure_oring(self.image, bg, th)
-        finally:
-            QApplication.restoreOverrideCursor()
-
-        if self.result is None:
-            QMessageBox.warning(
-                self, "Detection Failed",
-                "Could not detect inner/outer ring contours.\n"
-                "Try adjusting BG value or threshold.")
-            return
-
-        # Auto-detect resolution scale and normalize to reference
-        h, w = self.image.shape[:2]
-        self._resolution_scale = compute_resolution_scale(w, h)
-        self.result_normed = normalize_measurements(self.result, self._resolution_scale)
-
-        # Display overlay
-        self.overlay_image = draw_overlay(self.image, self.result)
-        self._show_cv(self.overlay_image, self.img_label)
-
-        # Display mask with contour outline
-        mask_vis = cv2.cvtColor(self.result["mask"], cv2.COLOR_GRAY2BGR)
-        cv2.drawContours(
-            mask_vis, [self.result["outer_contour"]], -1, (0, 255, 0), 2)
-        cv2.drawContours(
-            mask_vis, [self.result["inner_contour"]], -1, (0, 0, 255), 2)
-        self._show_cv(mask_vis, self.mask_label)
-
-        # Evaluate against thresholds
-        self._evaluate()
-
-        # Show extra informational metrics (normalized values)
-        r = self.result_normed
-        scale_str = f"scale={self._resolution_scale:.2f}" if abs(self._resolution_scale - 1.0) > 0.01 else ""
-        self.info_label.setText(
-            f"center_dx={r['center_dx']:+.1f}  center_dy={r['center_dy']:+.1f}  "
-            f"max_thick={r['max_thickness']:.1f}  "
-            f"thick_std={r['thickness_std']:.1f}  "
-            f"circ_o={r['circularity_outer']:.4f}  "
-            f"edge_clr={r['edge_clearance']:.0f}  "
-            f"area={self.result['annular_area']:,}  {scale_str}".rstrip())
-
-    def _evaluate(self):
-        """Compare each metric against thresholds.
-
-        Verdict priority:
-            1. REWORK  — any "rework"-category metric fails (shape — fixable)
-            2. REJECT  — any "reject"-category metric fails (thickness / size)
-            3. PASS    — everything within tolerance
-
-        Uses resolution-normalized measurements so that thresholds
-        (calibrated at REFERENCE_RESOLUTION) apply at any input size.
-        """
-        if self.result is None:
-            return
-
-        # Use normalized measurements for threshold comparison
-        normed = getattr(self, "result_normed", self.result)
-
-        self._read_thresholds_from_table()
+        normed = state.result_normed if state.result_normed else state.result
+        _read_thresholds_from_ui()
         rework_fails = []
         reject_fails = []
 
-        for row, (key, name, _unit, ttype, dec, *_, category) in enumerate(METRIC_DEFS):
+        for key, name, _unit, ttype, dec, *rest in METRIC_DEFS:
+            category = rest[-1]  # last element is verdict_category
             val = normed.get(key)
             if val is None:
                 continue
 
-            lo = self.thresholds[key]["lo"]
-            hi = self.thresholds[key]["hi"]
+            lo = state.thresholds[key]["lo"]
+            hi = state.thresholds[key]["hi"]
 
-            # Check if this metric is enabled via checkbox
-            metric_enabled = self.metric_checks.get(key) is not None and \
-                             self.metric_checks[key].isChecked()
-
-            # Update measured value
             fmt = f"{{:.{dec}f}}"
-            val_item = self.table.item(row, 2)
-            val_item.setText(fmt.format(val))
+            dpg.set_value(f"val_{key}", fmt.format(val))
 
-            # If metric is disabled, show value but mark as skipped
-            status_item = self.table.item(row, 5)
-            if not metric_enabled:
-                status_item.setText("⏭ SKIP")
-                status_item.setForeground(QColor(120, 120, 120))
-                val_item.setForeground(QColor(120, 120, 120))
-                continue
-
-            # Check pass / fail
             passed = True
-            # outer_radius: only flag if TOO LARGE (ignore min — smaller outer is not rework)
-            # inner_radius: only flag if TOO SMALL (ignore max — larger inner is not rework)
             if key == "outer_radius":
                 if val > hi:
                     passed = False
@@ -1505,419 +743,510 @@ class InspectionGUI(QMainWindow):
                     passed = False
 
             if passed:
-                status_item.setText("✅ PASS")
-                status_item.setForeground(QColor(76, 175, 80))
-                val_item.setForeground(QColor(200, 200, 200))
+                dpg.set_value(f"status_{key}", "PASS")
+                dpg.configure_item(f"status_{key}", color=(76, 175, 80))
+                dpg.configure_item(f"val_{key}", color=(200, 200, 200))
             else:
-                status_item.setText("❌ FAIL")
-                status_item.setForeground(QColor(244, 67, 54))
-                val_item.setForeground(QColor(244, 67, 54))
+                dpg.set_value(f"status_{key}", "FAIL")
+                dpg.configure_item(f"status_{key}", color=(244, 67, 54))
+                dpg.configure_item(f"val_{key}", color=(244, 67, 54))
                 if category == "rework":
                     rework_fails.append(name)
                 else:
                     reject_fails.append(name)
 
-        # ── Overall verdict ──────────────────────────────────────────────
-        # Check REWORK first (fixable), then REJECT (unfixable)
-        # Clear prediction panels (model only runs on PASS)
-        self.pred_overlay_label.setText(f"{self._defect_model} prediction (PASS images)")
-        self.pred_overlay_label.setPixmap(QPixmap())
-        self.pred_mask_label.setText("Predicted defect mask")
-        self.pred_mask_label.setPixmap(QPixmap())
-        self._pred_overlay = None
-        self._pred_mask = None
-        self._pred_result = None
+        # -- Overall verdict -----------------------------------------------
+
+        state.pred_overlay = None
+        state.pred_result = None
+
         if rework_fails:
-            # REWORK — shape issues fixable by trimming
-            self.verdict_label.setText("🔧  REWORK")
-            self.verdict_label.setStyleSheet("color: white;")
-            self.verdict_frame.setStyleSheet(
-                "background:#C62828; border-radius:12px; padding:8px;")
-            detail_parts = []
-            detail_parts.append(
-                f"Shape ({len(rework_fails)}): " + ", ".join(rework_fails))
-            if reject_fails:
-                detail_parts.append(
-                    f"Also failing ({len(reject_fails)}): " + ", ".join(reject_fails))
-            self.verdict_detail.setText(" | ".join(detail_parts))
-            self.verdict_detail.setStyleSheet("color:#FFCDD2;")
+            dpg.set_value("verdict_text", "REWORK")
+            dpg.bind_item_theme("verdict_box", themes["rework"])
+            state.verdict = "REWORK"
+            # Show overlay on FAIL
+            if state.overlay_image is not None:
+                _show_image(state.overlay_image)
 
         elif reject_fails:
-            # REJECT — thickness / concentricity / area issues (unfixable)
-            self.verdict_label.setText("⛔  REJECT")
-            self.verdict_label.setStyleSheet("color: white;")
-            self.verdict_frame.setStyleSheet(
-                "background:#4A148C; border-radius:12px; padding:8px;")
-            self.verdict_detail.setText(
-                f"{len(reject_fails)} metric(s): " + ", ".join(reject_fails))
-            self.verdict_detail.setStyleSheet("color:#CE93D8;")
+            dpg.set_value("verdict_text", "REJECT")
+            dpg.bind_item_theme("verdict_box", themes["reject"])
+            state.verdict = "REJECT"
+            # Show overlay on FAIL
+            if state.overlay_image is not None:
+                _show_image(state.overlay_image)
 
         else:
-            # Geometric verdict = PASS — run defect model for confirmation
-            model_name = self._defect_model
-            self.pred_overlay_label.setText(f"Running {model_name}…")
-            self.pred_mask_label.setText("")
-            QApplication.processEvents()  # update UI before blocking inference
-
-            if model_name == "YOLO v11":
-                has_defect = self._run_yolo_on_pass()
-            else:
-                has_defect = self._run_maskrcnn_on_pass()
+            # Geometric PASS → run Mask R-CNN defect model
+            dpg.set_value("info_text", "Running Mask R-CNN...")
+            precomputed = getattr(state, '_precomputed_720', None)
+            has_defect = _run_maskrcnn_on_pass(precomputed_720=precomputed)
 
             if has_defect:
-                # Override: model found defects on a geometrically-passing image
-                n_det = self._pred_result["num_detections"]
-                top_score = max(self._pred_result["scores"]) if n_det > 0 else 0
-                self.verdict_label.setText("⛔  REJECT (AI)")
-                self.verdict_label.setStyleSheet("color: white;")
-                self.verdict_frame.setStyleSheet(
-                    "background:#4A148C; border-radius:12px; padding:8px;")
-                self.verdict_detail.setText(
-                    f"Geometry OK, but {model_name} detected {n_det} defect(s)  "
-                    f"(top score {top_score:.0%})")
-                self.verdict_detail.setStyleSheet("color:#CE93D8;")
+                dpg.set_value("verdict_text", "REJECT")
+                dpg.bind_item_theme("verdict_box", themes["reject"])
+                state.verdict = "REJECT"
+                # Show defect overlay on FAIL
+                if state.pred_overlay is not None:
+                    _show_image(state.pred_overlay)
+                elif state.overlay_image is not None:
+                    _show_image(state.overlay_image)
             else:
-                # Confirmed PASS
-                self.verdict_label.setText("✅  PASS")
-                self.verdict_label.setStyleSheet("color: white;")
-                self.verdict_frame.setStyleSheet(
-                    "background:#2E7D32; border-radius:12px; padding:8px;")
-                self.verdict_detail.setText(
-                    f"All metrics within tolerance • {model_name}: no defects")
-                self.verdict_detail.setStyleSheet("color:#C8E6C9;")
+                dpg.set_value("verdict_text", "PASS")
+                dpg.bind_item_theme("verdict_box", themes["pass"])
+                state.verdict = "PASS"
+                # PASS — show original image (no overlay)
+                if state.image is not None:
+                    _show_image(state.image)
 
-    def _clear_results(self):
-        for row in range(self.table.rowCount()):
-            self.table.item(row, 2).setText("—")
-            self.table.item(row, 2).setForeground(QColor(170, 170, 170))
-            self.table.item(row, 5).setText("—")
-            self.table.item(row, 5).setForeground(QColor(170, 170, 170))
-        self.verdict_label.setText("AWAITING")
-        self.verdict_label.setStyleSheet("color:#ccc;")
-        self.verdict_frame.setStyleSheet(
-            "background:#555; border-radius:12px; padding:8px;")
-        self.verdict_detail.setText("Load an image and click Analyze")
-        self.verdict_detail.setStyleSheet("color:#bbb;")
-        # Clear prediction panels
-        self._pred_overlay = None
-        self._pred_mask = None
-        self._pred_result = None
-        self.pred_overlay_label.setText(f"{self._defect_model} prediction (PASS images)")
-        self.pred_overlay_label.setPixmap(QPixmap())
-        self.pred_mask_label.setText("Predicted defect mask")
-        self.pred_mask_label.setPixmap(QPixmap())
+    # -- Load image at path -----------------------------------------------
 
-    def _on_threshold_edited(self, _=None):
-        if self.result is not None:
-            self._evaluate()
+    def _load_image_path(path: str):
+        img = cv2.imread(path)
+        if img is None:
+            dpg.set_value("info_text", f"Cannot read: {path}")
+            return
 
-    def _load_best_thresholds(self) -> Dict[str, Dict]:
-        """Load tuned JSON if available, else fall back to σ-based.
+        state.image = img
+        state.overlay_image = None
+        state.result = None
+        state.result_normed = None
+        _show_image(img)
+        _clear_results()
+        _update_analyze_btn()
 
-        After loading, widen all REJECT-category thresholds by 10 %.
-        """
-        tuned_path = TUNED_JSON.get(self.current_model)
-        if tuned_path:
-            tuned = load_tuned_thresholds(tuned_path)
-            if tuned:
-                # Fill any missing metrics from σ-based
-                sigma_t = compute_thresholds(self.good_stats, self.sigma)
-                for key in sigma_t:
-                    if key not in tuned:
-                        tuned[key] = sigma_t[key]
-                thresholds = tuned
-            else:
-                thresholds = compute_thresholds(self.good_stats, self.sigma)
-        else:
-            thresholds = compute_thresholds(self.good_stats, self.sigma)
+        folder = str(Path(path).parent)
+        exts = {'.bmp', '.jpg', '.jpeg', '.png', '.tiff'}
+        files = sorted(
+            [os.path.join(folder, f) for f in os.listdir(folder)
+             if Path(f).suffix.lower() in exts],
+            key=lambda p: Path(p).name.lower())
+        state.file_list = files
+        try:
+            state.file_index = files.index(os.path.normpath(path))
+        except ValueError:
+            state.file_index = 0
+        _update_nav_btns()
 
-        # Widen REJECT thresholds by 10 %
-        reject_keys = {m[0] for m in METRIC_DEFS if m[8] == "reject"}
-        for key in reject_keys:
-            if key not in thresholds:
-                continue
-            lo = thresholds[key]["lo"]
-            hi = thresholds[key]["hi"]
-            # lo gets 10 % lower, hi gets 10 % higher
-            if lo > 0:
-                thresholds[key]["lo"] = round(lo * 0.9, 4)
-            if hi < 9999:
-                thresholds[key]["hi"] = round(hi * 1.1, 4)
+        h, w = img.shape[:2]
+        dpg.set_value("info_text", f"Loaded: {Path(path).name}  ({w}x{h})")
 
-        return thresholds
+    # -- Navigation -------------------------------------------------------
 
-    def _recompute_thresholds(self, sigma):
-        self.sigma = sigma
-        self.thresholds = self._load_best_thresholds()
-        self._sync_thresholds_to_table()
-        if self.result is not None:
-            self._evaluate()
+    def _navigate(delta: int):
+        idx = state.file_index + delta
+        if 0 <= idx < len(state.file_list):
+            _load_image_path(state.file_list[idx])
 
-    def _on_model_changed(self, model_name: str):
-        self.current_model = model_name
-        csv_path = MODEL_CSV[model_name]
-        self.good_stats = load_good_stats(csv_path)
-        self.thresholds = self._load_best_thresholds()
-        self._sync_thresholds_to_table()
-        if self.result is not None:
-            self._evaluate()
+    # -- Model button callback --------------------------------------------
+
+    def _on_model_btn(model_name: str):
+        state.current_model = model_name
+        state.good_stats = load_good_stats(MODEL_CSV[model_name])
+        state.thresholds = load_best_thresholds(
+            model_name, state.good_stats, state.sigma)
+        _update_model_btns()
+        _sync_thresholds_to_ui()
+        if state.result is not None:
+            _evaluate()
         tuned_path = TUNED_JSON.get(model_name)
         if tuned_path and tuned_path.exists():
-            self.info_label.setText(
-                f"✓ Switched to {model_name} — tuned thresholds from {tuned_path.name}")
-        elif self.good_stats:
-            self.info_label.setText(
-                f"✓ Switched to {model_name} — σ-based from {csv_path.name}  "
-                f"(σ = {self.sigma})")
+            dpg.set_value("info_text", f"{model_name} - tuned thresholds loaded")
+        elif state.good_stats:
+            dpg.set_value("info_text", f"{model_name} - sigma={state.sigma}")
         else:
-            self.info_label.setText(
-                f"⚠ No threshold data for {model_name} — using defaults")
+            dpg.set_value("info_text", f"{model_name} - using defaults")
 
-    def _reset_thresholds(self):
-        self.thresholds = self._load_best_thresholds()
-        self._sync_thresholds_to_table()
-        if self.result is not None:
-            self._evaluate()
+    # -- Analyze callback -------------------------------------------------
 
-    # ── Camera helpers (Hikrobot) ─────────────────────────────────────────
+    def _on_analyze(sender=None, app_data=None):
+        if state.image is None:
+            return
+        t_start = time.perf_counter()
+        th = dpg.get_value("spin_thresh")
 
-    def _init_camera(self) -> bool:
-        """Enumerate Hikrobot devices, create handle, open the first camera."""
+        dpg.set_value("info_text", "Analyzing...")
+
+        # ── Run measure_oring and bin_crop_720 concurrently ───────
+        # They're independent: measure_oring uses original image,
+        # bin_crop_720 also uses original image but produces a different
+        # output.  Both are CPU-bound so threading overlaps their work.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_geo = pool.submit(measure_oring, state.image,
+                                  DEFAULT_BG_VALUE, th)
+            fut_720 = pool.submit(bin_crop_720, state.image)
+            state.result = fut_geo.result()
+            state._precomputed_720 = fut_720.result()
+
+        if state.result is None:
+            dpg.set_value("info_text",
+                          "Detection failed - adjust threshold")
+            dpg.set_value("cycle_time_text", "")
+            return
+
+        h, w = state.image.shape[:2]
+        state.resolution_scale = compute_resolution_scale(w, h)
+        state.result_normed = normalize_measurements(
+            state.result, state.resolution_scale)
+        state.overlay_image = draw_overlay(state.image, state.result)
+
+        _evaluate()
+
+        t_end = time.perf_counter()
+        cycle_ms = (t_end - t_start) * 1000
+        dpg.set_value("cycle_time_text", f"Cycle Time: {cycle_ms:.0f} ms")
+        dpg.set_value("info_text", f"Analysis complete  ({cycle_ms:.0f} ms)")
+
+    # -- File dialog callback ---------------------------------------------
+
+    def _file_selected(sender, app_data):
+        selections = app_data.get("selections", {})
+        if selections:
+            path = list(selections.values())[0]
+            _load_image_path(path)
+
+    # -- Threshold edit callback ------------------------------------------
+
+    def _on_threshold_edited(sender=None, app_data=None):
+        if state.result is not None:
+            _evaluate()
+
+    # -- Camera callbacks -------------------------------------------------
+
+    def _on_toggle_stream(sender=None, app_data=None):
+        if state.camera_streaming:
+            _stop_stream()
+        else:
+            _start_stream()
+
+    def _start_stream():
         if not HIKROBOT_AVAILABLE:
-            QMessageBox.warning(
-                self, "Camera Error",
-                "Hikrobot SDK not available.\n"
-                "Install the MVS SDK and ensure MvImport is on the Python path.")
-            return False
-        if self._camera is not None:
-            return True  # already initialised
-
-        try:
-            deviceList = MV_CC_DEVICE_INFO_LIST()
-            tlayerType = MV_GIGE_DEVICE | MV_USB_DEVICE
-            ret = MvCamera.MV_CC_EnumDevices(tlayerType, deviceList)
-            if ret != 0 or deviceList.nDeviceNum == 0:
-                QMessageBox.warning(self, "Camera Error", "No Hikrobot cameras found!")
-                return False
-
-            self._camera = MvCamera()
-            stDevInfo = cast(
-                deviceList.pDeviceInfo[0], POINTER(MV_CC_DEVICE_INFO)).contents
-            ret = self._camera.MV_CC_CreateHandle(stDevInfo)
-            if ret != 0:
-                self._camera = None
-                QMessageBox.warning(
-                    self, "Camera Error", f"CreateHandle failed (0x{ret:08X})")
-                return False
-
-            ret = self._camera.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
-            if ret != 0:
-                self._camera.MV_CC_DestroyHandle()
-                self._camera = None
-                QMessageBox.warning(
-                    self, "Camera Error", f"OpenDevice failed (0x{ret:08X})")
-                return False
-
-            # Free-run mode (no hardware trigger)
-            self._camera.MV_CC_SetEnumValue("TriggerMode", 0)
-            return True
-
-        except Exception as e:
-            self._camera = None
-            QMessageBox.warning(
-                self, "Camera Error", f"Camera initialisation failed:\n{e}")
-            return False
-
-    def _toggle_stream(self):
-        """Toggle camera live stream on / off."""
-        if self._camera_streaming:
-            self._stop_stream()
-        else:
-            self._start_stream()
-
-    def _start_stream(self):
-        """Open camera (if needed), start grabbing, start preview timer."""
-        if not self._init_camera():
+            dpg.set_value("info_text", "Hikrobot SDK not available")
             return
-        if self._camera_streaming:
-            return
+        if state.camera is None:
+            try:
+                deviceList = MV_CC_DEVICE_INFO_LIST()
+                tlayerType = MV_GIGE_DEVICE | MV_USB_DEVICE
+                ret = MvCamera.MV_CC_EnumDevices(tlayerType, deviceList)
+                if ret != 0 or deviceList.nDeviceNum == 0:
+                    dpg.set_value("info_text", "No cameras found")
+                    return
+                state.camera = MvCamera()
+                stDevInfo = cast(
+                    deviceList.pDeviceInfo[0],
+                    POINTER(MV_CC_DEVICE_INFO)).contents
+                state.camera.MV_CC_CreateHandle(stDevInfo)
+                state.camera.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
+                state.camera.MV_CC_SetEnumValue("TriggerMode", 0)
+            except Exception as e:
+                state.camera = None
+                dpg.set_value("info_text", f"Camera error: {e}")
+                return
 
-        ret = self._camera.MV_CC_StartGrabbing()
+        ret = state.camera.MV_CC_StartGrabbing()
         if ret != 0:
-            QMessageBox.warning(
-                self, "Camera Error", f"StartGrabbing failed (0x{ret:08X})")
+            dpg.set_value("info_text",
+                          f"StartGrabbing failed (0x{ret:08X})")
             return
 
-        self._camera_streaming = True
-        self.stream_btn.setText("⏹ Stop Stream")
-        self.capture_btn.setEnabled(True)
-        self.load_btn.setEnabled(False)
-        self.analyze_btn.setEnabled(False)
+        state.camera_streaming = True
+        dpg.configure_item("btn_stream", label="Stop Stream")
+        dpg.configure_item("btn_capture", enabled=True)
+        dpg.set_value("info_text", "Camera streaming - press Capture")
 
-        if self._stream_timer is None:
-            self._stream_timer = QTimer(self)
-            self._stream_timer.timeout.connect(self._update_stream_preview)
-        self._stream_timer.start(66)   # ~15 fps preview
-        self.info_label.setText("Camera streaming — press Capture to grab a frame")
+    def _stop_stream():
+        if state.camera is not None and state.camera_streaming:
+            state.camera.MV_CC_StopGrabbing()
+        state.camera_streaming = False
+        dpg.configure_item("btn_stream", label="Start Stream")
+        dpg.configure_item("btn_capture", enabled=False)
 
-    def _stop_stream(self):
-        """Stop preview timer and camera grabbing."""
-        if self._stream_timer is not None:
-            self._stream_timer.stop()
-        if self._camera is not None and self._camera_streaming:
-            self._camera.MV_CC_StopGrabbing()
-        self._camera_streaming = False
-        self.stream_btn.setText("📷 Start Stream")
-        self.capture_btn.setEnabled(False)
-        self.load_btn.setEnabled(True)
-
-    def _grab_frame(self) -> Optional[np.ndarray]:
-        """Grab a single frame from the camera.
-
-        Returns a BGR numpy array or None on failure.
-        """
-        if self._camera is None or not self._camera_streaming:
+    def _grab_frame() -> Optional[np.ndarray]:
+        if state.camera is None or not state.camera_streaming:
             return None
-
         stOutFrame = MV_FRAME_OUT()
         memset(byref(stOutFrame), 0, sizeof(stOutFrame))
-
-        ret = self._camera.MV_CC_GetImageBuffer(stOutFrame, 1000)
+        ret = state.camera.MV_CC_GetImageBuffer(stOutFrame, 1000)
         if ret != 0:
             return None
-
         try:
             buf_len = stOutFrame.stFrameInfo.nFrameLen
             pData = (c_ubyte * buf_len).from_address(stOutFrame.pBufAddr)
             raw = np.frombuffer(pData, dtype=np.uint8).copy()
-
-            h = stOutFrame.stFrameInfo.nHeight
-            w = stOutFrame.stFrameInfo.nWidth
+            fh = stOutFrame.stFrameInfo.nHeight
+            fw = stOutFrame.stFrameInfo.nWidth
             px = stOutFrame.stFrameInfo.enPixelType
-
-            # ── Pixel-format conversion to BGR ────────────────────────────
-            if px == 0x01080001:          # Mono8
-                frame = raw.reshape(h, w)
-                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-            elif px == 0x01080009:        # BayerRG8
-                frame = raw.reshape(h, w)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
-            elif px == 0x0108000A:        # BayerGB8
-                frame = raw.reshape(h, w)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BayerGB2BGR)
-            elif px == 0x0108000B:        # BayerGR8
-                frame = raw.reshape(h, w)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BayerGR2BGR)
-            elif px == 0x01080008:        # BayerBG8
-                frame = raw.reshape(h, w)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BayerBG2BGR)
-            elif px == 0x02180014:        # RGB8
-                frame = raw.reshape(h, w, 3)
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            elif px == 0x02180015:        # BGR8
-                frame = raw.reshape(h, w, 3)
+            if px == 0x01080001:
+                frame = cv2.cvtColor(raw.reshape(fh, fw), cv2.COLOR_GRAY2BGR)
+            elif px == 0x01080009:
+                frame = cv2.cvtColor(raw.reshape(fh, fw), cv2.COLOR_BayerRG2BGR)
+            elif px == 0x0108000A:
+                frame = cv2.cvtColor(raw.reshape(fh, fw), cv2.COLOR_BayerGB2BGR)
+            elif px == 0x0108000B:
+                frame = cv2.cvtColor(raw.reshape(fh, fw), cv2.COLOR_BayerGR2BGR)
+            elif px == 0x01080008:
+                frame = cv2.cvtColor(raw.reshape(fh, fw), cv2.COLOR_BayerBG2BGR)
+            elif px == 0x02180014:
+                frame = cv2.cvtColor(raw.reshape(fh, fw, 3), cv2.COLOR_RGB2BGR)
+            elif px == 0x02180015:
+                frame = raw.reshape(fh, fw, 3)
             else:
-                # Fallback — treat as single-channel
                 try:
-                    frame = raw.reshape(h, w)
-                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    frame = cv2.cvtColor(raw.reshape(fh, fw), cv2.COLOR_GRAY2BGR)
                 except ValueError:
-                    frame = raw.reshape(h, w, -1)[:, :, :3].copy()
+                    frame = raw.reshape(fh, fw, -1)[:, :, :3].copy()
             return frame
         finally:
-            self._camera.MV_CC_FreeImageBuffer(stOutFrame)
+            state.camera.MV_CC_FreeImageBuffer(stOutFrame)
 
-    def _update_stream_preview(self):
-        """QTimer callback — grab a frame and show it in the preview."""
-        frame = self._grab_frame()
-        if frame is not None:
-            self._latest_frame = frame
-            self._show_cv(frame, self.img_label)
-
-    def _capture_frame(self):
-        """Freeze the current live frame and load it for analysis."""
-        if not self._camera_streaming:
-            QMessageBox.information(
-                self, "No Stream", "Start the camera stream first.")
+    def _on_capture(sender=None, app_data=None):
+        if not state.camera_streaming:
             return
-
-        # Stop the stream so the user can work with a still image
-        self._stop_stream()
-
-        frame = self._latest_frame
+        _stop_stream()
+        frame = state.latest_frame
         if frame is None:
-            QMessageBox.warning(
-                self, "Capture Error", "No frame available from the camera.")
+            dpg.set_value("info_text", "No frame available")
             return
+        state.image = frame
+        state.overlay_image = None
+        state.result = None
+        _show_image(frame)
+        _clear_results()
+        _update_analyze_btn()
+        state.file_list = []
+        state.file_index = -1
+        _update_nav_btns()
+        fh, fw = frame.shape[:2]
+        dpg.set_value("info_text", f"Captured from camera ({fw}x{fh})")
 
-        self.image = frame
-        self.overlay_image = None
-        self.result = None
-        self._show_cv(frame, self.img_label)
-        self.mask_label.setText("Click  🔍 Analyze  to process")
-        self.mask_label.setPixmap(QPixmap())
-        self.analyze_btn.setEnabled(True)
-        self._clear_results()
+    # -- Per-frame update (camera streaming) ------------------------------
 
-        # Clear file navigation (this is from camera, not a file)
-        self._file_list = []
-        self._file_index = -1
-        self._update_nav_buttons()
+    def _frame_update():
+        """Called every frame from the render loop."""
+        # Update model status indicator with color
+        mrcnn_txt = f"Mask R-CNN: {state.maskrcnn_status}"
+        dpg.set_value("status_maskrcnn", mrcnn_txt)
 
-        h, w = frame.shape[:2]
-        self.info_label.setText(f"Captured from camera  ({w}×{h})")
-        self.setWindowTitle("O-Ring Inspection — Camera Capture")
-
-    def _release_camera(self):
-        """Release all camera resources."""
-        self._stop_stream()
-        if self._camera is not None:
-            try:
-                self._camera.MV_CC_CloseDevice()
-                self._camera.MV_CC_DestroyHandle()
-            except Exception:
-                pass
-            self._camera = None
-
-    def closeEvent(self, event):
-        """Ensure camera is released when the window is closed."""
-        self._release_camera()
-        super().closeEvent(event)
-
-    # ── Display helpers ──────────────────────────────────────────────────
-
-    def _show_cv(self, cv_img: np.ndarray, label: QLabel):
-        if cv_img is None:
-            return
-        if len(cv_img.shape) == 2:
-            rgb = cv2.cvtColor(cv_img, cv2.COLOR_GRAY2RGB)
+        if state.maskrcnn_ready:
+            dpg.bind_item_theme("status_maskrcnn", themes["status_ready"])
+        elif "error" in state.maskrcnn_status:
+            dpg.bind_item_theme("status_maskrcnn", themes["status_error"])
         else:
-            rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        pix = QPixmap.fromImage(qimg)
-        scaled = pix.scaled(
-            label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        label.setPixmap(scaled)
+            dpg.bind_item_theme("status_maskrcnn", themes["status_loading"])
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self.overlay_image is not None:
-            self._show_cv(self.overlay_image, self.img_label)
-        elif self.image is not None:
-            self._show_cv(self.image, self.img_label)
-        if self.result is not None and "mask" in self.result:
-            mask_vis = cv2.cvtColor(
-                self.result["mask"], cv2.COLOR_GRAY2BGR)
-            cv2.drawContours(
-                mask_vis, [self.result["outer_contour"]], -1, (0, 255, 0), 2)
-            cv2.drawContours(
-                mask_vis, [self.result["inner_contour"]], -1, (0, 0, 255), 2)
-            self._show_cv(mask_vis, self.mask_label)
-        if self._pred_overlay is not None:
-            self._show_cv(self._pred_overlay, self.pred_overlay_label)
-        if self._pred_mask is not None:
-            self._show_cv(self._pred_mask, self.pred_mask_label)
+        # Camera streaming preview
+        if state.camera_streaming:
+            frame = _grab_frame()
+            if frame is not None:
+                state.latest_frame = frame
+                _show_image(frame)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Build widgets (all functions are now defined)
+    # ══════════════════════════════════════════════════════════════════════
+
+    # -- File dialog (hidden until triggered) -----------------------------
+    with dpg.file_dialog(directory_selector=False, show=False,
+                         callback=_file_selected,
+                         tag="file_dialog", width=700, height=400):
+        dpg.add_file_extension(".bmp")
+        dpg.add_file_extension(".jpg")
+        dpg.add_file_extension(".jpeg")
+        dpg.add_file_extension(".png")
+        dpg.add_file_extension(".tiff")
+        dpg.add_file_extension(".*")
+
+    # -- Main window ------------------------------------------------------
+    with dpg.window(tag="primary_window"):
+
+        # ── TOP STATUS BAR: DL model readiness ────────────────────────
+        with dpg.child_window(height=38, tag="status_bar", border=False):
+            with dpg.group(horizontal=True):
+                dpg.add_text("DL Model:", color=(160, 160, 170))
+                dpg.add_spacer(width=10)
+                dpg.add_text("Mask R-CNN: loading...",
+                             tag="status_maskrcnn",
+                             color=(255, 193, 7))
+                dpg.add_spacer(width=40)
+                dpg.add_text("", tag="info_text", color=(140, 160, 190),
+                             wrap=500)
+        if status_font:
+            dpg.bind_item_font("status_bar", status_font)
+
+        dpg.add_spacer(height=2)
+
+        with dpg.group(horizontal=True):
+
+            # ── LEFT PANEL: image display ─────────────────────────────────
+            with dpg.child_window(width=830, tag="left_panel"):
+                dpg.add_image("tex_main", tag="img_display")
+
+            # ── RIGHT PANEL: controls + results ───────────────────────────
+            with dpg.child_window(tag="right_panel"):
+
+                # --- O-Ring Model toggle buttons --------------------------
+                _hdr = dpg.add_text("O-RING MODEL", color=(130, 170, 220))
+                if heading_font:
+                    dpg.bind_item_font(_hdr, heading_font)
+                dpg.add_spacer(height=4)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="Model 1", tag="btn_model1",
+                                   width=200, height=50,
+                                   callback=lambda: _on_model_btn("Model 1"))
+                    dpg.add_spacer(width=10)
+                    dpg.add_button(label="Model 2", tag="btn_model2",
+                                   width=200, height=50,
+                                   callback=lambda: _on_model_btn("Model 2"))
+
+                dpg.add_spacer(height=10)
+                dpg.add_separator()
+                dpg.add_spacer(height=6)
+
+                # --- Detection controls ----------------------------------
+                _hdr2 = dpg.add_text("DETECTION", color=(130, 170, 220))
+                if heading_font:
+                    dpg.bind_item_font(_hdr2, heading_font)
+                dpg.add_spacer(height=4)
+                with dpg.group(horizontal=True):
+                    btn_ld = dpg.add_button(label="Load Image", tag="btn_load",
+                                   width=120, height=36,
+                                   callback=lambda: dpg.show_item("file_dialog"))
+                    dpg.bind_item_theme(btn_ld, themes["btn_green"])
+                    dpg.add_spacer(width=4)
+                    dpg.add_button(label="Analyze", tag="btn_analyze",
+                                   width=120, height=36,
+                                   callback=_on_analyze)
+
+                dpg.add_spacer(height=6)
+
+                # Navigation
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="< Prev", tag="btn_prev",
+                                   width=90, height=30, enabled=False,
+                                   callback=lambda: _navigate(-1))
+                    dpg.add_spacer(width=8)
+                    dpg.add_text("", tag="nav_label")
+                    dpg.add_spacer(width=8)
+                    dpg.add_button(label="Next >", tag="btn_next",
+                                   width=90, height=30, enabled=False,
+                                   callback=lambda: _navigate(1))
+
+                dpg.add_spacer(height=6)
+
+                # Camera controls
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="Start Stream", tag="btn_stream",
+                                   width=130, height=30,
+                                   callback=_on_toggle_stream)
+                    dpg.add_spacer(width=4)
+                    dpg.add_button(label="Capture", tag="btn_capture",
+                                   width=100, height=30, enabled=False,
+                                   callback=_on_capture)
+
+                # Threshold
+                dpg.add_spacer(height=6)
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Thresh:", color=(160, 160, 170))
+                    dpg.add_input_int(tag="spin_thresh", default_value=30,
+                                      min_value=1, max_value=255,
+                                      min_clamped=True, max_clamped=True,
+                                      width=70, step=0)
+
+                # Detection threshold
+                dpg.add_spacer(height=4)
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Detection Threshold:", color=(160, 160, 170))
+                    dpg.add_input_float(tag="spin_det_thresh",
+                                        default_value=0.5,
+                                        min_value=0.1, max_value=0.8,
+                                        min_clamped=True, max_clamped=True,
+                                        width=80, step=0.05,
+                                        format="%.2f")
+
+                dpg.add_spacer(height=10)
+                dpg.add_separator()
+                dpg.add_spacer(height=6)
+
+                # --- Verdict banner (BIG) ─────────────────────────────────
+                with dpg.child_window(height=100, tag="verdict_box",
+                                      border=False):
+                    dpg.add_spacer(height=16)
+                    _vt = dpg.add_text("AWAITING", tag="verdict_text",
+                                 color=(204, 204, 204), indent=16)
+                    if large_font:
+                        dpg.bind_item_font(_vt, large_font)
+
+                dpg.add_spacer(height=4)
+                dpg.add_text("", tag="cycle_time_text",
+                             color=(140, 200, 255))
+
+                dpg.add_spacer(height=8)
+                dpg.add_separator()
+                dpg.add_spacer(height=6)
+
+                # --- Metrics table ----------------------------------------
+                _hdr3 = dpg.add_text("MEASUREMENTS & THRESHOLDS",
+                             color=(130, 170, 220))
+                if heading_font:
+                    dpg.bind_item_font(_hdr3, heading_font)
+                dpg.add_spacer(height=4)
+
+                with dpg.table(tag="metrics_table", header_row=True,
+                               borders_innerH=True, borders_outerH=True,
+                               borders_innerV=True, borders_outerV=True,
+                               resizable=True, pad_outerX=True):
+                    dpg.add_table_column(label="Metric", width_fixed=True,
+                                         init_width_or_weight=180)
+                    dpg.add_table_column(label="Measured", width_fixed=True,
+                                         init_width_or_weight=90)
+                    dpg.add_table_column(label="Min", width_fixed=True,
+                                         init_width_or_weight=90)
+                    dpg.add_table_column(label="Max", width_fixed=True,
+                                         init_width_or_weight=90)
+                    dpg.add_table_column(label="Status", width_fixed=True,
+                                         init_width_or_weight=70)
+
+                    for key, name, unit, ttype, dec, step, s_lo, s_hi, category in METRIC_DEFS:
+                        label_text = f"{name}" + (f" ({unit})" if unit else "")
+                        cat_tag_s = "[R]" if category == "rework" else "[X]"
+                        cat_color = (255, 183, 77) if category == "rework" else (239, 83, 80)
+
+                        with dpg.table_row():
+                            dpg.add_text(f"{cat_tag_s} {label_text}",
+                                         color=cat_color)
+                            dpg.add_text("-", tag=f"val_{key}",
+                                         color=(170, 170, 175))
+                            dpg.add_input_float(
+                                tag=f"lo_{key}",
+                                default_value=state.thresholds[key]["lo"],
+                                min_value=s_lo, max_value=s_hi,
+                                min_clamped=True, max_clamped=True,
+                                width=80, step=0,
+                                format=f"%.{dec}f",
+                                enabled=(ttype != "max"),
+                                callback=_on_threshold_edited)
+                            dpg.add_input_float(
+                                tag=f"hi_{key}",
+                                default_value=state.thresholds[key]["hi"],
+                                min_value=s_lo, max_value=s_hi,
+                                min_clamped=True, max_clamped=True,
+                                width=80, step=0,
+                                format=f"%.{dec}f",
+                                enabled=(ttype != "min"),
+                                callback=_on_threshold_edited)
+                            dpg.add_text("-", tag=f"status_{key}",
+                                         color=(170, 170, 175))
+
+    # ── Initial UI state ─────────────────────────────────────────────────
+    _update_model_btns()
+    _update_analyze_btn()
+    _update_nav_btns()
+    dpg.bind_item_theme("verdict_box", themes["awaiting"])
+
+    # Set initial info text
+    dpg.set_value("info_text", "Ready")
+
+    return _frame_update
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1925,65 +1254,89 @@ class InspectionGUI(QMainWindow):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
-    app = QApplication(sys.argv)
+    state = AppState()
 
-    # Dark palette
-    pal = QPalette()
-    pal.setColor(QPalette.Window,          QColor(53, 53, 53))
-    pal.setColor(QPalette.WindowText,      QColor(220, 220, 220))
-    pal.setColor(QPalette.Base,            QColor(35, 35, 35))
-    pal.setColor(QPalette.AlternateBase,   QColor(53, 53, 53))
-    pal.setColor(QPalette.Text,            QColor(220, 220, 220))
-    pal.setColor(QPalette.Button,          QColor(53, 53, 53))
-    pal.setColor(QPalette.ButtonText,      QColor(220, 220, 220))
-    pal.setColor(QPalette.Highlight,       QColor(42, 130, 218))
-    pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
-    pal.setColor(QPalette.ToolTipBase,     QColor(42, 42, 42))
-    pal.setColor(QPalette.ToolTipText,     QColor(220, 220, 220))
-    app.setPalette(pal)
+    # Start loading DL models in background immediately
+    preload_models(state)
 
-    app.setStyleSheet("""
-        QGroupBox {
-            font-weight: bold;
-            border: 1px solid #555;
-            border-radius: 6px;
-            margin-top: 8px;
-            padding-top: 14px;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            left: 10px;
-            padding: 0 4px;
-        }
-        QSpinBox, QDoubleSpinBox {
-            background: #3a3a3a;
-            border: 1px solid #555;
-            border-radius: 3px;
-            padding: 2px 4px;
-            color: #ddd;
-        }
-        QPushButton {
-            border: 1px solid #666;
-            border-radius: 4px;
-            padding: 4px 10px;
-        }
-        QPushButton:hover {
-            background: #4a4a4a;
-        }
-        QTableWidget {
-            gridline-color: #444;
-        }
-        QHeaderView::section {
-            background: #3a3a3a;
-            border: 1px solid #555;
-            padding: 4px;
-            font-weight: bold;
-        }
-    """)
+    dpg.create_context()
+    dpg.create_viewport(title="O-Ring Inspection - Pass / Rework / Reject",
+                        width=1580, height=1000)
 
-    window = InspectionGUI()
-    window.show()
-    sys.exit(app.exec())
+    # ── Font registry ─────────────────────────────────────────────────
+    with dpg.font_registry():
+        # Try system fonts; fall back to DPG default
+        _font_candidates = [
+            r"C:\Windows\Fonts\segoeui.ttf",
+            r"C:\Windows\Fonts\arial.ttf",
+            r"C:\Windows\Fonts\calibri.ttf",
+        ]
+        _font_path = None
+        for _fp in _font_candidates:
+            if os.path.isfile(_fp):
+                _font_path = _fp
+                break
+
+        if _font_path:
+            default_font = dpg.add_font(_font_path, 18)
+            large_font   = dpg.add_font(_font_path, 44)
+            heading_font = dpg.add_font(_font_path, 22)
+            status_font  = dpg.add_font(_font_path, 15)
+        else:
+            default_font = None
+            large_font   = None
+            heading_font = None
+            status_font  = None
+
+    if default_font:
+        dpg.bind_font(default_font)
+
+    # ── Dark theme ────────────────────────────────────────────────────
+    with dpg.theme() as global_theme:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (25, 25, 30))
+            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (32, 32, 38))
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (230, 230, 235))
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (45, 45, 52))
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (60, 60, 70))
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, (50, 50, 60))
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (50, 50, 58))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (65, 65, 78))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (50, 50, 58))
+            dpg.add_theme_color(dpg.mvThemeCol_Header, (50, 50, 58))
+            dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, (65, 65, 78))
+            dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, (50, 50, 58))
+            dpg.add_theme_color(dpg.mvThemeCol_TableHeaderBg, (40, 40, 48))
+            dpg.add_theme_color(dpg.mvThemeCol_TableBorderStrong, (60, 60, 70))
+            dpg.add_theme_color(dpg.mvThemeCol_TableBorderLight, (48, 48, 56))
+            dpg.add_theme_color(dpg.mvThemeCol_Separator, (70, 70, 82))
+            dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg, (25, 25, 30))
+            dpg.add_theme_color(dpg.mvThemeCol_ScrollbarGrab, (60, 60, 70))
+            dpg.add_theme_color(dpg.mvThemeCol_ScrollbarGrabHovered, (80, 80, 95))
+            dpg.add_theme_color(dpg.mvThemeCol_ScrollbarGrabActive, (90, 90, 108))
+            dpg.add_theme_color(dpg.mvThemeCol_TitleBg, (25, 25, 30))
+            dpg.add_theme_color(dpg.mvThemeCol_TitleBgActive, (35, 35, 42))
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 6)
+            dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 8)
+            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 8)
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 8, 5)
+            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 10, 6)
+            dpg.add_theme_style(dpg.mvStyleVar_ScrollbarSize, 14)
+            dpg.add_theme_style(dpg.mvStyleVar_GrabRounding, 4)
+
+    dpg.bind_theme(global_theme)
+
+    frame_update = build_gui(state, default_font, large_font, heading_font, status_font)
+
+    dpg.setup_dearpygui()
+    dpg.show_viewport()
+    dpg.set_primary_window("primary_window", True)
+
+    while dpg.is_dearpygui_running():
+        frame_update()
+        dpg.render_dearpygui_frame()
+
+    dpg.destroy_context()
 
 
 if __name__ == "__main__":
