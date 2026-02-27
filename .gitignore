@@ -6,6 +6,7 @@ maskrcnn/dataset/
 maskrcnn/dataset_bkp/
 maskrcnn/dataset_bkp2/
 dataset/
+onnx_export/*.onnx
 Original Data/
 oring_crops/
 oring_patches_640/
