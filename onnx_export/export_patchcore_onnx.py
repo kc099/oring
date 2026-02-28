@@ -38,6 +38,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 
+# ─── Ensure cuDNN DLLs are on PATH for onnxruntime-gpu ─────────────────
+_torch_lib = Path(torch.__file__).parent / "lib"
+if _torch_lib.exists():
+    os.environ["PATH"] = str(_torch_lib) + os.pathsep + os.environ.get("PATH", "")
+
 # ─── Paths ───────────────────────────────────────────────────────────────
 WORKSPACE = Path(__file__).resolve().parent.parent
 RESULTS_DIR = WORKSPACE / "patchcore" / "results"
