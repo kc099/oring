@@ -17,6 +17,8 @@ Usage:
     python onnx_export/export_patchcore_onnx.py --model model1
     python onnx_export/export_patchcore_onnx.py --model model2
     python onnx_export/export_patchcore_onnx.py --all
+    python onnx_export/export_patchcore_onnx.py --results-dir patchcore/results_cropped --model model1_cropped
+    python onnx_export/export_patchcore_onnx.py --results-dir patchcore/results_cropped --model model2_cropped
 
 Author: GitHub Copilot
 Date:   February 28, 2026
@@ -45,7 +47,7 @@ if _torch_lib.exists():
 
 # ─── Paths ───────────────────────────────────────────────────────────────
 WORKSPACE = Path(__file__).resolve().parent.parent
-RESULTS_DIR = WORKSPACE / "patchcore" / "results"
+RESULTS_DIR = WORKSPACE / "patchcore" / "results"  # default; overridden by --results-dir
 OUTPUT_DIR = Path(__file__).resolve().parent
 
 # Allow importing from workspace root
@@ -470,19 +472,26 @@ def export_model(model_name: str, backbone: str = "resnet50", opset: int = 17):
 # ─── CLI ─────────────────────────────────────────────────────────────────
 
 def main():
+    global RESULTS_DIR
+
     parser = argparse.ArgumentParser(
         description="Export trained PatchCore model(s) to ONNX")
     parser.add_argument("--model", type=str, default=None,
-                        choices=["model1", "model2"],
-                        help="Which model to export (default: all available)")
+                        help="Model name prefix, e.g. model1, model1_cropped (default: all available)")
     parser.add_argument("--backbone", type=str, default="resnet50",
                         choices=["resnet50", "resnet101"])
     parser.add_argument("--opset", type=int, default=17)
     parser.add_argument("--all", action="store_true",
                         help="Export all available models")
+    parser.add_argument("--results-dir", type=str, default=None,
+                        help="Path to results directory (default: patchcore/results)")
     args = parser.parse_args()
 
+    if args.results_dir:
+        RESULTS_DIR = Path(args.results_dir).resolve()
+
     print("PatchCore → ONNX Export")
+    print(f"  Results dir: {RESULTS_DIR}")
     print("=" * 70)
 
     if args.all or args.model is None:

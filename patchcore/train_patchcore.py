@@ -88,7 +88,7 @@ def train_single(
     print(f"  Train dir : {train_dir}")
     print(f"  Backbone  : {backbone}")
     print(f"  Coreset   : {coreset_ratio:.0%}")
-    print(f"  Resize    : {resize} → CenterCrop {center_crop}")
+    print(f"  Resize    : direct to {resize}x{resize}")
     print(f"{'='*70}")
 
     t0 = time.time()

@@ -32,11 +32,10 @@ from .config import (
 def get_transform(resize: int = RESIZE_SIZE,
                   center_crop: int = CENTER_CROP_SIZE,
                   is_train: bool = True) -> transforms.Compose:
-    """Standard PatchCore transform: resize → center-crop → normalize."""
+    """PatchCore transform: direct resize to square → normalize."""
     return transforms.Compose([
         transforms.ToPILImage(),
-        transforms.Resize(resize, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(center_crop),
+        transforms.Resize((resize, resize), interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.ToTensor(),
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])

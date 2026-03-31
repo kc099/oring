@@ -48,10 +48,10 @@ YOLO_CONF = 0.25
 
 # Per-model 2σ thresholds (mean + 2·std evaluated on training crops)
 MODEL_THRESHOLDS = {
-    "model1_cropped_resnet50": 17.05,
-    "model2_cropped_resnet50": 19.77,
+    "model1_cropped_resnet50": 22.71,
+    "model2_cropped_resnet50": 23.70,
 }
-DEFAULT_THRESHOLD = 17.0
+DEFAULT_THRESHOLD = 23.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -105,7 +105,7 @@ def load_patchcore(pkl_path: Path) -> PatchCore:
 #  Inference pipeline
 # ═══════════════════════════════════════════════════════════════════════════
 
-def yolo_crop(yolo_model: YOLO, img_bgr: np.ndarray, padding: int = 10):
+def yolo_crop(yolo_model: YOLO, img_bgr: np.ndarray, padding: int = 0):
     """Resize → YOLO → return (cropped_image, bbox_on_resized).
 
     Returns:
@@ -207,7 +207,7 @@ class InferenceWorker(QThread):
     finished = Signal(float, np.ndarray, np.ndarray, np.ndarray, tuple, float)
     error = Signal(str)
 
-    def __init__(self, yolo_model, patchcore_model, img_bgr, padding=10):
+    def __init__(self, yolo_model, patchcore_model, img_bgr, padding=0):
         super().__init__()
         self.yolo_model = yolo_model
         self.patchcore_model = patchcore_model

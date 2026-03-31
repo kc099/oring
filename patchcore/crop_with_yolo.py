@@ -55,7 +55,7 @@ def find_best_yolo() -> str:
     return str(best_pts[0]) if best_pts else ""
 
 
-def get_mask_bbox(result, img_h: int, img_w: int, padding: int = 10):
+def get_mask_bbox(result, img_h: int, img_w: int, padding: int = 0):
     """Get bounding rectangle of all predicted masks combined.
 
     Returns (x1, y1, x2, y2) or None if no masks found.
@@ -87,7 +87,7 @@ def process_folder(
     model: YOLO,
     src_folder: Path,
     out_folder: Path,
-    padding: int = 10,
+    padding: int = 0,
     conf: float = 0.25,
 ):
     """Process all images in a folder: resize → YOLO → crop → save."""
@@ -151,7 +151,7 @@ def main():
     parser = argparse.ArgumentParser(description="Crop images using YOLO masks")
     parser.add_argument("--model", type=str, default="",
                         help="Path to best.pt (auto-detected if omitted)")
-    parser.add_argument("--padding", type=int, default=10,
+    parser.add_argument("--padding", type=int, default=0,
                         help="Padding around mask bounding rect (pixels)")
     parser.add_argument("--conf", type=float, default=0.25,
                         help="YOLO confidence threshold")

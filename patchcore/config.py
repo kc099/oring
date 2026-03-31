@@ -17,8 +17,8 @@ WORKSPACE = Path(__file__).resolve().parent.parent
 
 # ─── Image settings ──────────────────────────────────────────────────────
 ORIGINAL_CROP_SIZE = 720          # binned/cropped image size
-RESIZE_SIZE = 660                 # resize long edge before center crop
-CENTER_CROP_SIZE = 640            # final size fed to backbone
+RESIZE_SIZE = 640                 # direct resize to this square size
+CENTER_CROP_SIZE = 640            # same as resize (no center crop)
 IMAGE_EXTENSIONS = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 # ─── ImageNet normalization ──────────────────────────────────────────────

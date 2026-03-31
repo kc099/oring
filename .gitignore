@@ -5,6 +5,10 @@ maskrcnn/__pycache__/
 maskrcnn/dataset/
 maskrcnn/dataset_bkp/
 maskrcnn/dataset_bkp2/
+patchcore/data/
+patchcore/results_cropped/
+patchcore/yolo_seg/*.pt
+patchcore/yolo_seg/runs/
 dataset/
 onnx_export/*.onnx
 Original Data/
