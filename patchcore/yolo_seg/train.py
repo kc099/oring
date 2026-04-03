@@ -41,7 +41,7 @@ def parse_args():
                     help="Max training epochs")
     p.add_argument("--batch", type=int, default=8,
                     help="Batch size")
-    p.add_argument("--imgsz", type=int, default=640,
+    p.add_argument("--imgsz", type=int, default=512,
                     help="Input image size")
     p.add_argument("--lr", type=float, default=0.01,
                     help="Initial learning rate")

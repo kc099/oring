@@ -5,8 +5,7 @@ Trains two separate PatchCore models:
   - Model 1: from data/patchcore-model1-crops/
   - Model 2: from data/patchcore-model2-crops/
 
-Since crops vary in size, images are resized (bicubic) and center-cropped
-to a uniform size before feature extraction — same as existing PatchCore pipeline.
+Crops are bicubic-resized to 384×384 before feature extraction.
 
 All cropped images are treated as "good" training data (PatchCore is
 unsupervised — learns normal appearance only).
@@ -14,7 +13,7 @@ unsupervised — learns normal appearance only).
 Usage:
     python train_patchcore.py                    # train both models
     python train_patchcore.py --model model1     # train one model
-    python train_patchcore.py --backbone resnet101 --coreset 0.10
+    python train_patchcore.py --backbone resnet101 --coreset 0.01
 """
 
 import argparse
@@ -51,7 +50,7 @@ MODEL_CONFIGS = {
 def train_single(
     model_key: str,
     backbone: str = "resnet50",
-    coreset_ratio: float = 0.25,
+    coreset_ratio: float = 0.01,
     batch_size: int = 8,
     num_workers: int = 4,
     resize: int = RESIZE_SIZE,
@@ -88,7 +87,7 @@ def train_single(
     print(f"  Train dir : {train_dir}")
     print(f"  Backbone  : {backbone}")
     print(f"  Coreset   : {coreset_ratio:.0%}")
-    print(f"  Resize    : direct to {resize}x{resize}")
+    print(f"  Resize    : bicubic to {resize}x{resize}")
     print(f"{'='*70}")
 
     t0 = time.time()
@@ -128,12 +127,12 @@ def main():
                         default="all", help="Which model to train")
     parser.add_argument("--backbone", choices=["resnet50", "resnet101"],
                         default="resnet50", help="Backbone architecture")
-    parser.add_argument("--coreset", type=float, default=0.03,
+    parser.add_argument("--coreset", type=float, default=0.01,
                         help="Coreset sampling ratio")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--resize", type=int, default=RESIZE_SIZE,
-                        help="Resize before center crop")
+                        help="Bicubic resize to this square size")
     parser.add_argument("--center-crop", type=int, default=CENTER_CROP_SIZE,
                         help="Center crop size")
     args = parser.parse_args()

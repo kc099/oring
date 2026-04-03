@@ -32,7 +32,7 @@ from .config import (
 def get_transform(resize: int = RESIZE_SIZE,
                   center_crop: int = CENTER_CROP_SIZE,
                   is_train: bool = True) -> transforms.Compose:
-    """PatchCore transform: direct resize to square → normalize."""
+    """PatchCore transform: bicubic resize to square → normalize."""
     return transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((resize, resize), interpolation=transforms.InterpolationMode.BICUBIC),

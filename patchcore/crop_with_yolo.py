@@ -38,7 +38,7 @@ SOURCE_FOLDERS = {
     "patchcore-model2": DATA_DIR / "patchcore-model2",
 }
 
-TARGET_W, TARGET_H = 640, 480
+TARGET_W, TARGET_H = 512, 384   # 4x4 binning of 2048x1536
 IMAGE_EXTENSIONS = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 

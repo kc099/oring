@@ -11,12 +11,12 @@ Converts the exported FP32 ONNX model to FP16 and compares:
 Usage:
     cd "F:\\standard elastomers"
     conda activate dl
-    python onnx_export/ablation_fp16.py --model model1
-    python onnx_export/ablation_fp16.py --model model2
+    python onnx_export/ablation_fp16.py --model model1_cropped
+    python onnx_export/ablation_fp16.py --model model2_cropped
     python onnx_export/ablation_fp16.py --all
 
 Author: GitHub Copilot
-Date:   February 28, 2026
+Date:   February 28, 2026 (updated April 2026 — 384×384 cropped models)
 """
 
 import argparse
@@ -42,35 +42,28 @@ from sklearn.metrics import roc_auc_score
 
 WORKSPACE = Path(__file__).resolve().parent.parent
 ONNX_DIR = Path(__file__).resolve().parent
-BINNED = WORKSPACE / "binned"
+CROPS = WORKSPACE / "oring_crops"
 
 # ImageNet normalization is inside the model, so we just need [0,1] RGB.
 
-# ─── Test image sets ─────────────────────────────────────────────────────
+# ─── Test image sets (YOLO-cropped O-ring images) ───────────────────────
 
 MODEL_TEST_DIRS = {
-    "model1": {
-        "good":    (BINNED / "model1good", 0),
-        "defect":  (BINNED / "model1defect", 1),
-        "defect2": (BINNED / "model1defect2", 1),
-        "defect3": (BINNED / "model1defect3", 1),
+    "model1_cropped": {
+        "good":   (CROPS / "model1good", 0),
+        "defect": (CROPS / "model1defect", 1),
     },
-    "model2": {
-        "good":   (BINNED / "good", 0),
-        "notok":  (BINNED / "notok", 1),
-        "notok2": (BINNED / "notok2", 1),
-        "notok3": (BINNED / "notok3", 1),
+    "model2_cropped": {
+        "good":  (CROPS / "good", 0),
+        "notok": (CROPS / "notok", 1),
     },
 }
 
 
-def load_and_preprocess(image_path: Path, resize: int = 660,
-                        crop: int = 640) -> np.ndarray:
-    """Load BMP → resize → center-crop → RGB [0,1] → NCHW float32."""
+def load_and_preprocess(image_path: Path, input_size: int = 384) -> np.ndarray:
+    """Load image → bicubic resize to input_size×input_size → RGB [0,1] → NCHW float32."""
     img = cv2.imread(str(image_path))
-    img = cv2.resize(img, (resize, resize), interpolation=cv2.INTER_CUBIC)
-    margin = (resize - crop) // 2
-    img = img[margin:margin + crop, margin:margin + crop]
+    img = cv2.resize(img, (input_size, input_size), interpolation=cv2.INTER_CUBIC)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     return np.transpose(img, (2, 0, 1))[np.newaxis]  # (1, 3, H, W)
 
@@ -136,12 +129,11 @@ def run_ablation(model_name: str, backbone: str = "resnet50"):
 
     # 3. Load metadata for preprocessing params
     json_path = ONNX_DIR / f"patchcore_{model_name}_{backbone}.json"
-    resize, crop = 660, 640
+    input_size = 384
     if json_path.exists():
         with open(json_path) as f:
             meta = json.load(f)
-        resize = meta.get("resize", 660)
-        crop = meta.get("center_crop", 640)
+        input_size = meta.get("center_crop", 384)
 
     # 4. Run on all test sets
     test_dirs = MODEL_TEST_DIRS.get(model_name, {})
@@ -167,7 +159,7 @@ def run_ablation(model_name: str, backbone: str = "resnet50"):
         set_map_diffs = []
 
         for img_path in images:
-            img_np = load_and_preprocess(img_path, resize, crop)
+            img_np = load_and_preprocess(img_path, input_size)
 
             out_fp32 = sess_fp32.run(None, {"image": img_np})
             out_fp16 = sess_fp16.run(None, {"image": img_np})
@@ -232,8 +224,9 @@ def run_ablation(model_name: str, backbone: str = "resnet50"):
 
     # 6. Benchmark GPU latency
     print(f"\n  GPU Latency Benchmark (5 runs each)...")
-    test_img = load_and_preprocess(
-        list(list(test_dirs.values())[0][0].glob("*.bmp"))[0], resize, crop)
+    first_dir = list(test_dirs.values())[0][0]
+    test_imgs = list(first_dir.glob("*.bmp")) + list(first_dir.glob("*.png"))
+    test_img = load_and_preprocess(test_imgs[0], input_size)
 
     # Warmup
     sess_fp32.run(None, {"image": test_img})
@@ -299,7 +292,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="FP32 vs FP16 ablation for PatchCore ONNX")
     parser.add_argument("--model", type=str, default=None,
-                        choices=["model1", "model2"])
+                        choices=["model1_cropped", "model2_cropped"])
     parser.add_argument("--backbone", type=str, default="resnet50")
     parser.add_argument("--all", action="store_true")
     args = parser.parse_args()
@@ -308,7 +301,7 @@ def main():
     print("=" * 70)
 
     if args.all or args.model is None:
-        for name in ["model1", "model2"]:
+        for name in ["model1_cropped", "model2_cropped"]:
             fp32 = ONNX_DIR / f"patchcore_{name}_{args.backbone}.onnx"
             if fp32.exists():
                 run_ablation(name, args.backbone)

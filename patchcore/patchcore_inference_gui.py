@@ -1,8 +1,8 @@
 """
 PatchCore Inference GUI  (PySide6)
 
-Full pipeline: Upload BMP (2048×1536) → Resize 640×480 → YOLO seg →
-Crop mask region → PatchCore anomaly detection → Display heatmap overlay.
+Full pipeline: Upload BMP (2048×1536) → 4×4 bin to 512×384 → YOLO seg →
+Crop mask region → PatchCore anomaly detection (variable-size) → Heatmap.
 
 Usage:
     python patchcore_inference_gui.py
@@ -43,15 +43,15 @@ from patchcore.patchcore_model import PatchCore, FeatureExtractor, aggregate_fea
 from patchcore.dataset import get_transform
 
 # ── Constants ────────────────────────────────────────────────────────────
-YOLO_W, YOLO_H = 640, 480
+YOLO_W, YOLO_H = 512, 384          # 4×4 binning of 2048×1536
 YOLO_CONF = 0.25
 
-# Per-model 2σ thresholds (mean + 2·std evaluated on training crops)
+# Per-model 2σ thresholds (will be re-evaluated after retraining)
 MODEL_THRESHOLDS = {
-    "model1_cropped_resnet50": 22.71,
-    "model2_cropped_resnet50": 23.70,
+    "model1_cropped_resnet50": 29.76,
+    "model2_cropped_resnet50": 30.60,
 }
-DEFAULT_THRESHOLD = 23.0
+DEFAULT_THRESHOLD = 30.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -117,7 +117,7 @@ def yolo_crop(yolo_model: YOLO, img_bgr: np.ndarray, padding: int = 0):
 
     results = yolo_model.predict(
         source=img_resized,
-        imgsz=YOLO_W,
+        imgsz=[YOLO_H, YOLO_W],
         conf=YOLO_CONF,
         device="cpu",
         verbose=False,

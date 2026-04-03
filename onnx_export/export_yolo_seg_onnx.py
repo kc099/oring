@@ -4,7 +4,10 @@ Export YOLO11-seg O-ring segmentation model to ONNX.
 Finds the latest best.pt from the YOLO training runs and exports it
 to this folder (onnx_export/) alongside the PatchCore ONNX models.
 
-Input:  [1, 3, 640, 640]  float32, RGB, 0-255
+The model was trained at imgsz=512 with rect mode on 512×384 images
+(4×4 binning of 2048×1536 originals).
+
+Input:  [1, 3, 384, 512]  float32, RGB, 0-1
 Output: standard YOLO segmentation outputs (boxes, scores, masks, protos)
 
 Usage:
@@ -43,8 +46,8 @@ def main():
     parser = argparse.ArgumentParser(description="Export YOLO11-seg to ONNX")
     parser.add_argument("--model", type=str, default="",
                         help="Path to best.pt (auto-detected if omitted)")
-    parser.add_argument("--imgsz", type=int, default=640,
-                        help="Export image size")
+    parser.add_argument("--imgsz", type=int, nargs="+", default=[384, 512],
+                        help="Export image size [H, W] (default: 384 512)")
     parser.add_argument("--opset", type=int, default=17,
                         help="ONNX opset version")
     args = parser.parse_args()
@@ -54,13 +57,15 @@ def main():
         print("ERROR: No YOLO model found. Train first or provide --model.")
         return
 
+    imgsz = args.imgsz if len(args.imgsz) > 1 else args.imgsz[0]
+
     from ultralytics import YOLO
 
     print("=" * 70)
     print("YOLO11-seg ONNX EXPORT")
     print("=" * 70)
     print(f"  Source model : {model_path}")
-    print(f"  Image size   : {args.imgsz}")
+    print(f"  Image size   : {imgsz}")
     print(f"  Opset        : {args.opset}")
     print(f"  Output dir   : {SCRIPT_DIR}")
 
@@ -69,7 +74,7 @@ def main():
     t0 = time.perf_counter()
     export_path = model.export(
         format="onnx",
-        imgsz=args.imgsz,
+        imgsz=imgsz,
         opset=args.opset,
         simplify=False,
         dynamic=False,
@@ -132,16 +137,15 @@ def main():
             WORKSPACE / "patchcore" / "data" / "patchcore-model1",
             WORKSPACE / "patchcore" / "data" / "patchcore-model2",
         ]
+        # Get expected H, W from model input shape
+        inp_h, inp_w = inp_shape[2], inp_shape[3]
         for d in test_dirs:
             imgs = sorted(d.glob("*.bmp"))[:1]
             if imgs:
                 img = cv2.imread(str(imgs[0]))
-                img_resized = cv2.resize(img, (640, 480))
-                # Pad to 640x640 (YOLO letterbox)
-                padded = np.zeros((640, 640, 3), dtype=np.uint8)
-                padded[:480, :640] = img_resized
-                # HWC→CHW, scale to 0-1
-                blob = padded.astype(np.float32).transpose(2, 0, 1)[np.newaxis] / 255.0
+                img_resized = cv2.resize(img, (inp_w, inp_h), interpolation=cv2.INTER_AREA)
+                # HWC→CHW, BGR→RGB, scale to 0-1
+                blob = img_resized[:, :, ::-1].astype(np.float32).transpose(2, 0, 1)[np.newaxis] / 255.0
                 out = session.run(None, {inp_name: blob})
                 print(f"\n  Real image test ({imgs[0].name}):")
                 print(f"    Output shapes: {[o.shape for o in out]}")
